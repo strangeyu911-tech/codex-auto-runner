@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest a safe improvement for Codex Auto Runner
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What long-running Codex workflow does this improve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the behavior and where it fits in the local-only safety model.
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Safety boundaries
+      options:
+        - label: This does not bypass or expand Codex quota limits.
+          required: true
+        - label: This does not auto-approve high-risk actions.
+          required: true
+        - label: This does not require committing local Codex state, tokens, logs, or private paths.
+          required: true

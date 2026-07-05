@@ -5,6 +5,10 @@
 
 # Codex Auto Runner
 
+[![Windows first](https://img.shields.io/badge/Windows-first-2563eb?style=for-the-badge)](#requirements)
+[![Local only](https://img.shields.io/badge/local-only-0f766e?style=for-the-badge)](#safety-boundaries)
+[![Node 20+](https://img.shields.io/badge/Node.js-20+-111827?style=for-the-badge)](package.json)
+
 > When the Codex 5-hour quota window recovers, automatically resume the active goal task that was already in progress, preserve the original thread context, and keep moving until the weekly quota is exhausted, the task is complete, or human judgment is required.
 
 Codex Auto Runner is a local recovery runner for Codex goal sessions. It is built for a very specific moment: a long Codex task is still clear, the thread context is still valuable, the goal is still active, but the 5-hour quota window has been exhausted.
@@ -16,6 +20,22 @@ Set a goal in Codex once. Codex Auto Runner detects the current session, checks 
 In practice, it turns Codex's 5-hour recovery windows into an automatic relay: quota returns, the task continues; quota is exhausted, the runner waits; quota returns again, the original goal moves forward again. The cycle continues until the weekly quota has been fully used, the task is complete, or the system reaches a point that needs a person.
 
 Codex Auto Runner is an unofficial local companion for Codex. It is not an OpenAI product and does not modify, bypass, or expand account limits. It simply helps you use the quota you already have with less idle time and more continuity.
+
+## Is This for You?
+
+Use it if:
+
+- You often ask Codex to perform multi-hour migrations, repairs, reviews, or generation tasks.
+- You already use Codex goal mode and want the same thread to continue when quota recovers.
+- You want a local-only runner that stops when login, quota, approvals, validation, or human judgment is required.
+
+Do not use it if:
+
+- You want to bypass, expand, or modify Codex account limits.
+- You expect the runner to accept high-risk approvals, push code, or deploy automatically.
+- You are not using Windows Codex Desktop.
+
+If this solves your long-running Codex workflow, please star the repository so other heavy Codex users can find it.
 
 ## Vision
 
@@ -186,6 +206,26 @@ pnpm --filter @car/web build
 pnpm --filter @car/daemon typecheck
 pnpm test
 ```
+
+## Contributing
+
+Useful contributions include:
+
+- Codex discovery support for more platforms.
+- More robust quota bucket parsing and reset-time handling.
+- Clearer safety boundaries, log redaction, and privacy checks.
+- UI usability, accessibility, and Chinese/English copy improvements.
+- Reproducible bug reports from real long-running task workflows.
+
+Before opening a pull request, run:
+
+```bash
+pnpm privacy:check
+pnpm typecheck
+pnpm test
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## Current Status
 

@@ -5,6 +5,10 @@
 
 # Codex Auto Runner
 
+[![Windows first](https://img.shields.io/badge/Windows-first-2563eb?style=for-the-badge)](#环境要求)
+[![Local only](https://img.shields.io/badge/local-only-0f766e?style=for-the-badge)](#安全边界)
+[![Node 20+](https://img.shields.io/badge/Node.js-20+-111827?style=for-the-badge)](package.json)
+
 > 当 Codex 的 5h 限额恢复时，自动开启正在进行中的目标任务；在不浪费任何一个恢复窗口的前提下，持续推进，直至任务完成、需要人工介入，或周额度被充分消耗。
 
 Codex Auto Runner 是一个运行在本地的 Codex 目标任务恢复器。它为一个非常具体、也非常真实的痛点而生：长任务跑到一半，5h 额度耗尽；上下文还在，目标还在，任务还没结束，但下一次额度恢复时，人不一定守在电脑前。
@@ -16,6 +20,22 @@ Codex Auto Runner 是一个运行在本地的 Codex 目标任务恢复器。它�
 换句话说，它把 Codex 的 5h 恢复窗口变成了一次次自动接力：额度恢复，任务继续；再次耗尽，再次等待；直到周额度被用到极致，或者目标真正抵达终点。
 
 这是一个非官方的本地工具，不属于 OpenAI 官方产品，也不会突破、规避或修改任何额度规则。它只是让你已经拥有的额度更有秩序、更少空转、更接近连续生产力。
+
+## 立即判断是否适合你
+
+适合：
+
+- 你经常让 Codex 做跨小时的迁移、修复、审查或生成任务。
+- 你已经会使用 Codex 目标模式，并希望恢复窗口到来时自动续跑同一个线程。
+- 你接受工具只在本机运行，并且遇到登录、额度未知、审批或验证失败时停止。
+
+不适合：
+
+- 你想绕过、扩容或修改 Codex 额度规则。
+- 你希望工具自动接受高风险权限、自动 push 或自动部署。
+- 你不使用 Windows Codex Desktop。
+
+如果这个项目正好解决你的长任务续跑痛点，欢迎给仓库点 star，让其他 Codex 重度用户更容易发现它。
 
 ## 核心愿景
 
@@ -186,6 +206,26 @@ pnpm --filter @car/web build
 pnpm --filter @car/daemon typecheck
 pnpm test
 ```
+
+## 参与贡献
+
+适合贡献的方向：
+
+- 新平台的 Codex 发现逻辑。
+- 更稳健的额度桶解析和恢复时间判断。
+- 更清楚的安全边界、日志脱敏和隐私检查。
+- UI 可用性、可访问性和中英文文案。
+- 可复现的 bug 报告和真实长任务使用反馈。
+
+提交前请运行：
+
+```bash
+pnpm privacy:check
+pnpm typecheck
+pnpm test
+```
+
+更多说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 当前状态
 
