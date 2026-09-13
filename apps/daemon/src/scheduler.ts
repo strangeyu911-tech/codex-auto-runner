@@ -67,7 +67,36 @@ export class Scheduler {
   /** 额度恢复后由 QuotaWatcher 调用 */
   async onQuotaRecovered(): Promise<void> {
     this.log.info("onQuotaRecovered -> tick");
+    // 关键：tick() 只会认领 READY 任务。WAITING_QUOTA 是「被额度打断」的落点，
+    // 若不在这里把它推回 READY，额度恢复后任务永远不会被认领 —— 这正是
+    // 「无 goal 线程续不上」的最后一环。此处批量唤醒所有等待额度的任务。
+    const woke = this.wakeQuotaWaitingTasks();
+    if (woke) this.log.info("quota recovered: moved WAITING_QUOTA tasks back to READY", { count: woke });
     await this.tick();
+  }
+
+  /**
+   * 把所有处于 WAITING_QUOTA 的任务推回 READY，使其可被 claim。
+   * 返回被唤醒的任务数。
+   */
+  private wakeQuotaWaitingTasks(): number {
+    const waiting = this.repo
+      .listTasks()
+      .filter((t) => t.status === "WAITING_QUOTA");
+    for (const t of waiting) {
+      this.repo.forceStatus(t.id, "READY");
+      // nextRunAt 置空：额度刚恢复，应立即可跑（否则会被旧的时间戳挡住）
+      this.repo.patch(t.id, {
+        nextRunAt: null,
+        quotaResetAt: null,
+        lastError: null,
+      });
+      this.repo.appendEvent(t.id, "quota/recovered", {
+        threadId: t.lastQuotaInterruptedThreadId ?? t.threadId ?? null,
+        interruptedAt: t.lastQuotaInterruptedAt,
+      });
+    }
+    return waiting.length;
   }
 
   /** 手动触发运行某任务 */
@@ -136,7 +165,9 @@ export class Scheduler {
       return;
     }
     // git 准备
-    const prep = prepareForRun(task.projectPath, { allowDirty: task.workspaceMode === "worktree" });
+    const prep = prepareForRun(task.projectPath, {
+      allowDirty: task.workspaceMode === "worktree" || process.env.CAR_ALLOW_DIRTY === "1",
+    });
     if (!prep.ok) {
       log.warn("git prepare failed", { reason: prep.reason });
       this.repo.forceStatus(task.id, "WAITING_USER");

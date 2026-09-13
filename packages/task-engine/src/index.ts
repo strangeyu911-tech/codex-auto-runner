@@ -113,10 +113,22 @@ export class TaskEngine {
     // 4. 处理结果
     if (outcome.status === "quota_exhausted") {
       this.repo.transitionInTx(task.id, "RUNNING", "WAITING_QUOTA");
+      // 落库「被额度打断」的线程与时间：这是无 goal 线程唯一的识别信号
+      // （thread/goal/get 对无 goal 线程返回 goal=null，无法据此判断）。
+      // 用局部变量 threadId 而非 task.threadId：新建线程的场景下 task.threadId 可能仍为 null。
+      const interruptedAt = Date.now();
       this.repo.patch(task.id, {
         quotaCycleCount: task.quotaCycleCount + 1,
         quotaResetAt: null,
+        lastQuotaInterruptedAt: interruptedAt,
+        lastQuotaInterruptedThreadId: threadId,
       });
+      this.repo.appendEvent(task.id, "quota/interrupted", {
+        threadId,
+        at: interruptedAt,
+        error: outcome.error,
+      }, runId);
+      log.warn("quota interrupted", { threadId, interruptedAt });
       this.saveCheckpoint(task, outcome);
       return outcome;
     }
@@ -181,15 +193,35 @@ export class TaskEngine {
   }
 
   private async resumeThread(task: ManagedTask, threadId: string): Promise<void> {
-    // 检查线程是否在他处活跃
-    const read = await this.client.request<{ thread?: { status?: { type?: string } } }>("thread/read", { threadId, includeTurns: false });
+    // 检查线程是否在他处活跃；同时用 turn 历史判定「上次是否被额度打断」。
+    // 必须 includeTurns: true —— 否则拿不到 turns，无法判定限额语义。
+    const read = await this.client.request<{
+      thread?: {
+        status?: { type?: string };
+        turns?: Array<{ id?: string; status?: string; error?: { message?: string; codexErrorInfo?: unknown } | null }>;
+      };
+    }>("thread/read", { threadId, includeTurns: true });
     const statusType = read.thread?.status?.type;
     if (statusType === "active" || statusType === "running") {
       throw new Error(`THREAD_ACTIVE_ELSEWHERE: thread ${threadId} status=${statusType}`);
     }
+
+    // 第 5 项：续跑前校验。用最近一个 turn 的 status/error 判定「是否被额度打断」。
+    // 设计为告警优先、不硬拦：额度刚恢复时续跑本就是预期行为，硬拦会破坏「丝滑续跑」。
+    const probe = probeQuotaInterrupted(read.thread?.turns);
+    if (probe.interrupted) {
+      this.log.warn("resuming a quota-interrupted thread", {
+        threadId, turnId: probe.turnId, turnStatus: probe.turnStatus, errorInfo: probe.errorInfo,
+      });
+      this.repo.appendEvent(task.id, "thread.resume.quota_probe", {
+        threadId, interrupted: true, turnId: probe.turnId,
+        turnStatus: probe.turnStatus, errorInfo: probe.errorInfo,
+      });
+    }
+
     await this.ensureGoalActive(threadId);
     await this.client.request("thread/resume", { threadId, approvalPolicy: this.approvalFor(task) });
-    this.repo.appendEvent(task.id, "thread/resumed", { threadId });
+    this.repo.appendEvent(task.id, "thread.resumed", { threadId, quotaInterrupted: probe.interrupted });
   }
 
   private async ensureGoalActive(threadId: string): Promise<void> {
@@ -241,6 +273,7 @@ export class TaskEngine {
     const isQuota = isQuotaError(errorInfo, errMsg);
 
     if (isQuota) {
+      this.log.warn("turn completed with quota error", { threadId, turnId, errorInfo, errMsg });
       resolver({ status: "quota_exhausted", result: null, validations: [], raw: params, error: errMsg });
       this.pendingTurns.delete(threadId);
       return;
@@ -321,7 +354,7 @@ export class TaskEngine {
 
   private buildPrompt(task: ManagedTask): string {
     if (task.mode === "resume_thread" || task.mode === "imported_thread") {
-      return "继续，并开启当前正在进行的目标任务";
+      return this.buildResumePrompt(task);
     }
 
     const lines: string[] = [];
@@ -333,6 +366,45 @@ export class TaskEngine {
       lines.push("");
       lines.push("恢复指令：");
       lines.push(task.resumeInstruction);
+    }
+    if (task.acceptanceCriteria.length) {
+      lines.push("");
+      lines.push("验收标准：");
+      task.acceptanceCriteria.forEach((c, i) => lines.push(`${i + 1}. ${c}`));
+    }
+    lines.push("");
+    lines.push("要求：");
+    lines.push("1. 不要自动 push、部署或发布。");
+    lines.push("2. 不要修改 Git 历史（reset --hard、push --force、clean -fd 等）。");
+    lines.push("3. 遇到需要高风险权限或歧义时停止并返回 needs_user。");
+    lines.push("4. 完成后请严格按 outputSchema 返回 JSON 结果。");
+    lines.push("5. remaining_items 为空且所有验证通过才算 completed。");
+    return lines.join("\n");
+  }
+
+  /**
+   * 续跑既有线程时的 prompt。
+   *
+   * 不依赖 Codex 的 goal 模式：goal 存在与否都能继续。
+   * 依靠的是 thread 自身的历史上下文 + 本指令，
+   * 因此无 goal 会话同样可以被接管并跨额度窗口续跑。
+   */
+  private buildResumePrompt(task: ManagedTask): string {
+    const lines: string[] = [];
+    lines.push("你正在被 Codex Auto Runner 恢复执行一个之前中断的任务。");
+    lines.push("这是同一个会话线程的延续，你之前的历史上下文都还在。");
+    lines.push("");
+    lines.push("请先回顾本会话中你上一次正在做的事，从中断的地方继续推进。");
+    lines.push("不要重头开始，不要开启新话题，不要重复询问已经得到过的信息。");
+    if (task.originalGoal?.trim()) {
+      lines.push("");
+      lines.push("本次要推进的工作：");
+      lines.push(task.originalGoal.trim());
+    }
+    if (task.resumeInstruction?.trim()) {
+      lines.push("");
+      lines.push("恢复指令：");
+      lines.push(task.resumeInstruction.trim());
     }
     if (task.acceptanceCriteria.length) {
       lines.push("");
@@ -388,6 +460,45 @@ function isQuotaError(info: unknown, msg: string | null): boolean {
   if (typeof info === "string" && info.toLowerCase().includes("usage")) return true;
   if (msg && /rate.?limit|usage limit|quota|额度|使用限制/i.test(msg)) return true;
   return false;
+}
+
+/**
+ * 判定线程「最近一个 turn 是否被额度打断」。
+ *
+ * 这是第 5 项的权威判据，也是无 goal 线程唯一的线程侧信号：
+ * - goal 侧的 thread/goal/get 对无 goal 线程返回 goal=null，无法据此判断；
+ * - turn 侧的 status/error 与是否设置 goal 无关，因此对两类线程都成立。
+ *
+ * 判据（取最近一个 turn）：
+ *   a) turn.status === "failed" 且 error.codexErrorInfo === "usageLimitExceeded"，或
+ *   b) turn.status === "failed"/"interrupted" 且 error.message 命中额度关键词。
+ */
+export interface QuotaProbe {
+  interrupted: boolean;
+  turnId: string | null;
+  turnStatus: string | null;
+  errorInfo: string | null;
+}
+
+export function probeQuotaInterrupted(
+  turns: Array<{ id?: string; status?: string; error?: { message?: string; codexErrorInfo?: unknown } | null }> | undefined,
+): QuotaProbe {
+  const none: QuotaProbe = { interrupted: false, turnId: null, turnStatus: null, errorInfo: null };
+  if (!turns?.length) return none;
+  const last = turns[turns.length - 1];
+  if (!last) return none;
+
+  const turnStatus = last.status ?? null;
+  const errorInfo = typeof last.error?.codexErrorInfo === "string" ? last.error.codexErrorInfo : null;
+  const errMsg = last.error?.message ?? null;
+
+  // 只在「失败 / 被打断」的终态上判定；inProgress/completed 不算被打断
+  if (turnStatus !== "failed" && turnStatus !== "interrupted") {
+    return { interrupted: false, turnId: last.id ?? null, turnStatus, errorInfo };
+  }
+
+  const interrupted = isQuotaError(last.error?.codexErrorInfo, errMsg);
+  return { interrupted, turnId: last.id ?? null, turnStatus, errorInfo };
 }
 
 /** 从 turn/completed 的 items 中抽取结构化 CompletionResult */

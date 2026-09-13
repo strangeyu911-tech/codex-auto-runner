@@ -35,6 +35,10 @@ export interface TaskSummary {
   useResetCreditOnWeeklyLimit: boolean;
   resetCreditLastAttemptAt: number | null;
   resetCreditLastOutcome: string | null;
+  /** 最近一次因 5h/周额度被打断的时间（task 级） */
+  lastQuotaInterruptedAt: number | null;
+  /** 最近一次被打断时绑定的线程 id（对无 goal 线程同样有值） */
+  lastQuotaInterruptedThreadId: string | null;
 }
 export interface StatusResp {
   quota: QuotaSnapshot | null;
@@ -71,4 +75,8 @@ export interface CodexSession {
   status: string;
   loaded: boolean;
   goal: CodexGoal | null;
+  /** 最近一次因 5h/周额度被打断的时间；有值即表示「上次被限额中断」，与是否设置 goal 无关 */
+  quotaInterruptedAt: number | null;
+  /** 被打断时所属的任务 id */
+  quotaInterruptedTaskId: string | null;
 }

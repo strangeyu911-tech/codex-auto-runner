@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   quota_reset_at      INTEGER,
   last_progress_hash  TEXT,
   stagnant_cycle_count INTEGER NOT NULL DEFAULT 0,
+  -- 最近一次被额度（5h / 周）打断的时间与被绑定的线程；用于无 goal 线程的续跑选取
+  last_quota_interrupted_at INTEGER,
+  last_quota_interrupted_thread_id TEXT,
   created_at          INTEGER NOT NULL,
   updated_at          INTEGER NOT NULL,
   started_at          INTEGER,

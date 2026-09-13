@@ -42,6 +42,7 @@ export function NewTask({ onCreated }: { onCreated: () => void }) {
     maxQuotaCycles: 20,
     networkAccess: false,
     useResetCreditOnWeeklyLimit: false,
+    resumeInstruction: "",
   });
 
   const upd = (k: string, v: unknown) => setForm({ ...form, [k]: v });
@@ -54,8 +55,19 @@ export function NewTask({ onCreated }: { onCreated: () => void }) {
       const resp = await api.codexSessions(30);
       setSessions(resp.sessions);
       setSessionId((cur) => {
-        if (cur && resp.sessions.some((s) => s.id === cur && s.goal)) return cur;
-        return resp.sessions.find((s) => s.goal)?.id || "";
+        if (cur && resp.sessions.some((s) => s.id === cur)) return cur;
+        // 第 4 项：默认选中「最近被 5h 限额打断的线程」。
+        // 后端已按「被打断优先 → 打断时间新者优先 → loaded → updatedAt」排序，
+        // 这里显式再挑一次，避免排序策略变化时前端失去这一语义。
+        // 注意：不依赖 goal —— 无 goal 线程同样会被选中。
+        const interrupted = resp.sessions.filter((s) => s.quotaInterruptedAt != null);
+        if (interrupted.length) {
+          const latest = interrupted.reduce((best, s) =>
+            (s.quotaInterruptedAt ?? 0) > (best.quotaInterruptedAt ?? 0) ? s : best,
+          );
+          return latest.id;
+        }
+        return (resp.sessions.find((s) => s.goal) ?? resp.sessions[0])?.id || "";
       });
     } catch (e) {
       setErr(String(e instanceof Error ? e.message : e));
@@ -100,7 +112,6 @@ export function NewTask({ onCreated }: { onCreated: () => void }) {
   const submitAuto = async () => {
     setErr(null);
     if (!selectedSession) return setErr(t("chooseSession"));
-    if (!selectedSession.goal) return setErr(t("sessionNeedsGoal"));
     if (!selectedSession.cwd) return setErr(t("sessionNoCwd"));
     setBusy(true);
     try {
@@ -115,7 +126,7 @@ export function NewTask({ onCreated }: { onCreated: () => void }) {
         title: titleFrom(selectedSession, objective),
         projectPath: selectedSession.cwd,
         originalGoal: objective,
-        resumeInstruction: "",
+        resumeInstruction: autoOptions.resumeInstruction.trim(),
         acceptanceCriteria: [],
         priority: priority.score,
         mode: "resume_thread",
@@ -163,18 +174,25 @@ export function NewTask({ onCreated }: { onCreated: () => void }) {
                 <button
                   key={s.id}
                   className={"session-item" + (s.id === sessionId ? " active" : "")}
-                  disabled={!s.goal}
                   onClick={() => setSessionId(s.id)}
                 >
                   <div className="session-main">
                     <span className="session-title">{s.name || s.preview || t("unnamedSession")}</span>
                     <span className="session-badges">
+                      {s.quotaInterruptedAt != null && (
+                        <span className="badge paused" title={t("quotaInterruptedHint")}>
+                          {t("quotaInterruptedBadge")}
+                        </span>
+                      )}
                       <span className={"badge " + (s.loaded ? "ready" : "unknown")}>{s.loaded ? t("currentLoaded") : s.status}</span>
                       <span className={"badge " + (s.goal ? goalBadgeClass(s.goal.status) : "unknown")}>{s.goal ? goalText(s.goal.status) : t("selectGoalSession")}</span>
                     </span>
                   </div>
                   <div className="session-meta mono">{s.cwd || t("noCwd")}</div>
                   <div className="session-preview">{s.goal?.objective || t("noGoalSession")}</div>
+                  {s.quotaInterruptedAt != null && (
+                    <div className="session-meta">{t("quotaInterruptedAt")}{formatTime(s.quotaInterruptedAt)}</div>
+                  )}
                 </button>
               ))}
               {!sessions.length && !sessionBusy && (
@@ -196,7 +214,16 @@ export function NewTask({ onCreated }: { onCreated: () => void }) {
 
             <div className="inspect-block">
               <label>{t("goal")}</label>
-              <p>{selectedSession?.goal?.objective || t("selectGoalSession")}</p>
+              <p>{selectedSession?.goal?.objective || selectedSession?.preview || selectedSession?.name || t("selectGoalSession")}</p>
+              {selectedSession && !selectedSession.goal && <span className="hint">{t("noGoalHint")}</span>}
+            </div>
+            <div className="form-row">
+              <label>{t("resumeInstruction")}</label>
+              <textarea
+                value={autoOptions.resumeInstruction}
+                onChange={(e) => setAutoOptions({ ...autoOptions, resumeInstruction: e.target.value })}
+                placeholder={t("resumeInstructionPh")}
+              />
             </div>
             <div className="inspect-grid">
               <div className="inspect-block">
@@ -265,7 +292,7 @@ export function NewTask({ onCreated }: { onCreated: () => void }) {
 
             {err && <div className="err">{err}</div>}
             <div className="toolbar">
-              <button className="primary" disabled={busy || !selectedSession?.goal} onClick={submitAuto}>
+              <button className="primary" disabled={busy || !selectedSession} onClick={submitAuto}>
                 {busy ? t("creating") : t("takeoverCreate")}
               </button>
               <span className="hint">{t("autoKeepsContext")}</span>
@@ -384,4 +411,13 @@ function goalBadgeClass(status: string): string {
   if (status === "paused" || status === "budgetLimited" || status === "usageLimited") return "paused";
   if (status === "blocked") return "failed";
   return "unknown";
+}
+
+/** 把被打断时间渲染成「MM-DD HH:mm」；跨年则补年份。 */
+function formatTime(ts: number): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  const md = `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  return d.getFullYear() === new Date().getFullYear() ? md : `${d.getFullYear()}-${md}`;
 }

@@ -56,6 +56,23 @@ async function main(): Promise<void> {
   const abnormal = repo.scanAbnormalRunning();
   if (abnormal.length) log.warn("recovery: marked abnormal tasks RECOVERING", { count: abnormal.length });
   for (const t of abnormal) {
+    // 第 6 项：保留「被额度打断」语义。
+    // 重启前如果这个任务正卡在 5h/周额度上（RUNNING 被 kill，或已经写了被打断标记），
+    // 一律降级成 WAITING_USER 会丢掉限额语义 —— 用户就不再能「丝滑续跑」，
+    // 必须手动确认。这里改为：命中限额特征 → WAITING_QUOTA；否则才 WAITING_USER。
+    const quotaHit = repo.lastRunQuotaExhausted(t.id) || t.lastQuotaInterruptedAt != null;
+    if (quotaHit) {
+      repo.forceStatus(t.id, "WAITING_QUOTA");
+      repo.patch(t.id, {
+        lastError: "process restarted mid-run while quota-limited; will auto-resume on recovery",
+      });
+      log.info("recovery: kept quota semantics", {
+        taskId: t.id,
+        threadId: t.lastQuotaInterruptedThreadId ?? t.threadId ?? null,
+        lastQuotaInterruptedAt: t.lastQuotaInterruptedAt,
+      });
+      continue;
+    }
     // 保守：RECOVERING -> WAITING_USER，等用户确认是否续跑
     repo.forceStatus(t.id, "WAITING_USER");
     repo.patch(t.id, { lastError: "process restarted mid-run; needs user confirm" });

@@ -128,7 +128,10 @@ export function startHttpApi(deps: HttpApiDeps, port = 0): Promise<{ port: numbe
 
     if (path === "/api/codex/sessions" && req.method === "GET") {
       const limit = Math.min(numOr(url.searchParams.get("limit"), 20), 50);
-      return sendJson(res, 200, await listCodexSessions(deps.client, limit));
+      // 第 3 项：把「被打断线程 → 时间/任务」索引从 repo 取出，用于排序与角标。
+      // 每次请求现算，保证刚被打断的线程立刻反映到排序里。
+      const quotaIndex = buildQuotaInterruptIndex(repo);
+      return sendJson(res, 200, await listCodexSessions(deps.client, limit, quotaIndex));
     }
 
     if (path === "/api/codex/goal/activate" && req.method === "POST") {
@@ -229,6 +232,9 @@ function summary(t: ManagedTask) {
     useResetCreditOnWeeklyLimit: t.useResetCreditOnWeeklyLimit,
     resetCreditLastAttemptAt: t.resetCreditLastAttemptAt,
     resetCreditLastOutcome: t.resetCreditLastOutcome,
+    // 第 2/6 项产物：任务级的「被额度打断」标记，前端任务列表同样可用
+    lastQuotaInterruptedAt: t.lastQuotaInterruptedAt,
+    lastQuotaInterruptedThreadId: t.lastQuotaInterruptedThreadId,
   };
 }
 
@@ -244,6 +250,14 @@ interface CodexThreadSummary {
   status: string;
   loaded: boolean;
   goal: CodexGoal | null;
+  /**
+   * 该线程最近一次因 5h/周额度被打断的时间（来自 tasks 表，不依赖 goal）。
+   * - 有值 → 前端可打「上次因 5h 限额中断」角标，并优先选中；
+   * - 无 goal 的线程同样会有值 —— 这是本次修复的关键。
+   */
+  quotaInterruptedAt: number | null;
+  /** 该线程最近一次被打断时所属的任务 id（便于前端一键续跑同一个任务）。 */
+  quotaInterruptedTaskId: string | null;
 }
 
 interface CodexGoal {
@@ -256,7 +270,38 @@ interface CodexGoal {
   updatedAt?: number;
 }
 
-async function listCodexSessions(client: AppServerClient, limit: number): Promise<{ sessions: CodexThreadSummary[] }> {
+/** 「被打断线程」查询索引：threadId -> { at, taskId } */
+interface QuotaInterruptIndex {
+  byThread: Map<string, { at: number; taskId: string }>;
+}
+
+/**
+ * 从持久层构造「被额度打断」的线程索引。
+ *
+ * 之所以放在应用层而不是直接依赖 goal：无 goal 线程的 goal 为 null，
+ * 唯一可靠的识别信号就是 tasks 表的 last_quota_interrupted_* 字段。
+ */
+function buildQuotaInterruptIndex(repo: SqliteRepository): QuotaInterruptIndex {
+  const byThread = new Map<string, { at: number; taskId: string }>();
+  try {
+    for (const t of repo.listTasks()) {
+      const tid = t.lastQuotaInterruptedThreadId;
+      const at = t.lastQuotaInterruptedAt;
+      if (!tid || at == null) continue;
+      const prev = byThread.get(tid);
+      if (!prev || at > prev.at) byThread.set(tid, { at, taskId: t.id });
+    }
+  } catch {
+    // 索引构造失败不应影响会话列表本身可用性
+  }
+  return { byThread };
+}
+
+async function listCodexSessions(
+  client: AppServerClient,
+  limit: number,
+  quotaIndex?: QuotaInterruptIndex,
+): Promise<{ sessions: CodexThreadSummary[] }> {
   const loaded = await client.request<{ data?: string[] }>("thread/loaded/list", {}).catch(() => ({ data: [] }));
   const loadedIds = new Set(loaded.data ?? []);
   const listed = await client.request<{ data?: unknown[] }>("thread/list", {
@@ -281,6 +326,7 @@ async function listCodexSessions(client: AppServerClient, limit: number): Promis
     const id = readString(t, "id");
     if (!id) continue;
     const goal = await getThreadGoal(client, id);
+    const hit = quotaIndex?.byThread.get(id);
     sessions.push({
       id,
       sessionId: readString(t, "sessionId"),
@@ -293,10 +339,27 @@ async function listCodexSessions(client: AppServerClient, limit: number): Promis
       status: readNestedString(t, "status", "type") ?? "unknown",
       loaded: loadedIds.has(id),
       goal,
+      quotaInterruptedAt: hit?.at ?? null,
+      quotaInterruptedTaskId: hit?.taskId ?? null,
     });
   }
 
-  sessions.sort((a, b) => Number(b.loaded) - Number(a.loaded) || (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  // 第 3 项：排序改为「最近被打断优先」。
+  // 原来 loaded 排在最前，导致刚被 5h 限额打断、但当前未 loaded 的线程被挤到后面，
+  // 用户（以及前端默认选中）就会挑中错误的线程。
+  // 新序：① 是否被额度打断过 → ② 打断时间新者优先 → ③ loaded → ④ 最近更新。
+  sessions.sort((a, b) => {
+    const aHit = a.quotaInterruptedAt != null ? 1 : 0;
+    const bHit = b.quotaInterruptedAt != null ? 1 : 0;
+    if (aHit !== bHit) return bHit - aHit;
+    if (aHit && bHit) {
+      const d = (b.quotaInterruptedAt ?? 0) - (a.quotaInterruptedAt ?? 0);
+      if (d !== 0) return d;
+    }
+    const ld = Number(b.loaded) - Number(a.loaded);
+    if (ld !== 0) return ld;
+    return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+  });
   return { sessions: sessions.slice(0, limit) };
 }
 

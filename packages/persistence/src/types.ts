@@ -55,6 +55,15 @@ export interface ManagedTask {
   lastProgressHash: string | null;
   stagnantCycleCount: number;
 
+  /**
+   * 最近一次因额度（5h 窗口 / 周额度）被打断的时间。
+   * 用于「无 goal 线程也能被识别并优先续跑」：goal 为 null 的线程不写 goal 状态，
+   * 因此识别信号必须落在 tasks 表上，不能依赖 thread/goal/get。
+   */
+  lastQuotaInterruptedAt: number | null;
+  /** 最近一次因额度被打断时所绑定的线程 id（可能是本任务刚新建的线程）。 */
+  lastQuotaInterruptedThreadId: string | null;
+
   createdAt: number;
   updatedAt: number;
   startedAt: number | null;
@@ -95,7 +104,9 @@ const TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   PREPARING: ["STARTING_THREAD", "WAITING_USER", "FAILED_FINAL"],
   STARTING_THREAD: ["RUNNING", "WAITING_QUOTA", "WAITING_AUTH", "FAILED_RETRYABLE"],
   RUNNING: ["VERIFYING", "WAITING_QUOTA", "WAITING_USER", "FAILED_RETRYABLE", "FAILED_FINAL", "CANCELLING", "WAITING_AUTH"],
-  VERIFYING: ["COMPLETED", "NEEDS_CONTINUE", "FAILED_RETRYABLE"],
+  // WAITING_USER：引擎在 Codex 未返回结构化 result（无法判定是否完成）时走此出边。
+  // 缺失这条边会导致任务永久卡在 VERIFYING（转换静默失败，无任何日志）。
+  VERIFYING: ["COMPLETED", "NEEDS_CONTINUE", "WAITING_USER", "FAILED_RETRYABLE"],
   NEEDS_CONTINUE: ["READY"],
   WAITING_QUOTA: ["READY"],
   WAITING_AUTH: ["READY"],

@@ -56,6 +56,8 @@ export class SqliteRepository {
     this.ensureTaskColumn("use_reset_credit_on_weekly_limit", "INTEGER NOT NULL DEFAULT 0");
     this.ensureTaskColumn("reset_credit_last_attempt_at", "INTEGER");
     this.ensureTaskColumn("reset_credit_last_outcome", "TEXT");
+    this.ensureTaskColumn("last_quota_interrupted_at", "INTEGER");
+    this.ensureTaskColumn("last_quota_interrupted_thread_id", "TEXT");
     this.db.prepare("INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)").run(1, Date.now());
   }
 
@@ -97,6 +99,8 @@ export class SqliteRepository {
       quotaResetAt: null,
       lastProgressHash: null,
       stagnantCycleCount: 0,
+      lastQuotaInterruptedAt: null,
+      lastQuotaInterruptedThreadId: null,
       createdAt: now,
       updatedAt: now,
       startedAt: null,
@@ -110,6 +114,7 @@ export class SqliteRepository {
         validation_commands,max_run_cycles,run_cycle_count,max_quota_cycles,quota_cycle_count,
         use_reset_credit_on_weekly_limit,reset_credit_last_attempt_at,reset_credit_last_outcome,
         max_retry_count,retry_count,next_run_at,quota_reset_at,last_progress_hash,stagnant_cycle_count,
+        last_quota_interrupted_at,last_quota_interrupted_thread_id,
         created_at,updated_at,started_at,finished_at,last_error,branch_name,worktree_path
       ) VALUES (
         @id,@title,@mode,@project_path,@thread_id,@session_id,@original_goal,@resume_instruction,@acceptance_criteria,
@@ -117,6 +122,7 @@ export class SqliteRepository {
         @validation_commands,@max_run_cycles,@run_cycle_count,@max_quota_cycles,@quota_cycle_count,
         @use_reset_credit_on_weekly_limit,@reset_credit_last_attempt_at,@reset_credit_last_outcome,
         @max_retry_count,@retry_count,@next_run_at,@quota_reset_at,@last_progress_hash,@stagnant_cycle_count,
+        @last_quota_interrupted_at,@last_quota_interrupted_thread_id,
         @created_at,@updated_at,@started_at,@finished_at,@last_error,@branch_name,@worktree_path
       )
     `).run({
@@ -150,6 +156,8 @@ export class SqliteRepository {
       quota_reset_at: t.quotaResetAt,
       last_progress_hash: t.lastProgressHash,
       stagnant_cycle_count: t.stagnantCycleCount,
+      last_quota_interrupted_at: t.lastQuotaInterruptedAt,
+      last_quota_interrupted_thread_id: t.lastQuotaInterruptedThreadId,
       created_at: t.createdAt,
       updated_at: t.updatedAt,
       started_at: t.startedAt,
@@ -188,8 +196,20 @@ export class SqliteRepository {
   /** 最高优先级可运行任务，事务内推进 READY -> PREPARING */
   claimNextRunnable(now = Date.now()): ManagedTask | undefined {
     if (this.hasRunningTask()) return undefined;
+    // 第 3 项（调度侧）：在优先级相同的前提下，「被额度打断」的 READY 任务先跑，
+    // 且其中被打断时间最新的最先跑 —— 对应「优先续跑最新的那条」。
+    // priority 仍是首要排序键，因此不会打乱用户显式设置的优先级。
     const row = this.db
-      .prepare(`SELECT * FROM tasks WHERE status = 'READY' AND (next_run_at IS NULL OR next_run_at <= ?) ORDER BY priority DESC, next_run_at ASC NULLS LAST, created_at ASC LIMIT 1`)
+      .prepare(
+        `SELECT * FROM tasks
+          WHERE status = 'READY' AND (next_run_at IS NULL OR next_run_at <= ?)
+          ORDER BY priority DESC,
+                   (last_quota_interrupted_at IS NOT NULL) DESC,
+                   last_quota_interrupted_at DESC NULLS LAST,
+                   next_run_at ASC NULLS LAST,
+                   created_at ASC
+          LIMIT 1`,
+      )
       .get(now) as Row | undefined;
     if (!row) return undefined;
     const ok = this.transitionInTx(String(row.id), "READY", "PREPARING", now);
@@ -227,6 +247,7 @@ export class SqliteRepository {
       "threadId", "sessionId", "runCycleCount", "quotaCycleCount", "retryCount",
       "nextRunAt", "quotaResetAt", "lastProgressHash", "stagnantCycleCount", "startedAt", "finishedAt",
       "lastError", "branchName", "worktreePath", "resetCreditLastAttemptAt", "resetCreditLastOutcome",
+      "lastQuotaInterruptedAt", "lastQuotaInterruptedThreadId",
     ] as const;
     const sets: string[] = [];
     const values: Record<string, string | number | null> = { task_id: taskId, updated_at: at };
@@ -294,6 +315,57 @@ export class SqliteRepository {
 
   finishRun(runId: string, status: string, resultJson: string | null, error: string | null, quotaExhausted = 0): void {
     this.db.prepare("UPDATE task_runs SET status = ?, finished_at = ?, result_json = ?, error = ?, quota_exhausted = ? WHERE id = ?").run(status, Date.now(), resultJson, error, quotaExhausted, runId);
+  }
+
+  /** 该任务最近一次 run 是否因额度被打断（用 task_runs.quota_exhausted，重启后可判定） */
+  lastRunQuotaExhausted(taskId: string): boolean {
+    // 加 rowid 次序键：同一毫秒内插入多条 run 时 started_at 会相同，
+    // 只按 started_at 排序结果不确定（会取到任意一条）。rowid 单调递增，可兜底定序。
+    const row = this.db
+      .prepare("SELECT quota_exhausted FROM task_runs WHERE task_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1")
+      .get(taskId) as { quota_exhausted?: number } | undefined;
+    return Number(row?.quota_exhausted ?? 0) === 1;
+  }
+
+  /**
+   * 「被额度打断」的线程索引：threadId -> 最近被打断时间。
+   *
+   * 供两处消费：
+   *  - 第 3 项：会话列表排序「最近被打断优先」；
+   *  - 第 4 项：前端默认选中 + 打角标。
+   *
+   * 关键：只依赖 tasks 表字段，不依赖 goal —— 无 goal 线程同样能被收录。
+   */
+  listQuotaInterruptedThreads(): Map<string, number> {
+    const rows = stmtAllAny(
+      this.db.prepare(
+        `SELECT last_quota_interrupted_thread_id AS tid, last_quota_interrupted_at AS at
+           FROM tasks
+          WHERE last_quota_interrupted_thread_id IS NOT NULL
+            AND last_quota_interrupted_at IS NOT NULL`,
+      ),
+    ) as Array<{ tid: string | null; at: number | null }>;
+    const out = new Map<string, number>();
+    for (const r of rows) {
+      if (!r.tid || r.at == null) continue;
+      const prev = out.get(r.tid);
+      // 同一线程可能被多个任务引用，取最新
+      if (prev == null || r.at > prev) out.set(r.tid, r.at);
+    }
+    return out;
+  }
+
+  /** 最近一次被额度打断的任务（用于重启恢复与「优先续跑最新」） */
+  findLatestQuotaInterruptedTask(): ManagedTask | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM tasks
+          WHERE last_quota_interrupted_at IS NOT NULL
+            AND status NOT IN ('COMPLETED','FAILED_FINAL','CANCELLED')
+          ORDER BY last_quota_interrupted_at DESC LIMIT 1`,
+      )
+      .get() as Row | undefined;
+    return row ? rowToTask(row) : undefined;
   }
 
   /* ----------------------------- events ----------------------------- */
@@ -390,6 +462,8 @@ function rowToTask(r: Row): ManagedTask {
     quotaResetAt: (r.quota_reset_at as number | null) ?? null,
     lastProgressHash: (r.last_progress_hash as string | null) ?? null,
     stagnantCycleCount: Number(r.stagnant_cycle_count),
+    lastQuotaInterruptedAt: (r.last_quota_interrupted_at as number | null) ?? null,
+    lastQuotaInterruptedThreadId: (r.last_quota_interrupted_thread_id as string | null) ?? null,
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at),
     startedAt: (r.started_at as number | null) ?? null,
