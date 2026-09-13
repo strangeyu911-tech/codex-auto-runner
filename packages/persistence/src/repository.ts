@@ -59,6 +59,8 @@ export class SqliteRepository {
     this.ensureTaskColumn("last_quota_interrupted_at", "INTEGER");
     this.ensureTaskColumn("last_quota_interrupted_thread_id", "TEXT");
     this.ensureTaskColumn("conflict_retry_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureTaskColumn("forked_from_thread_id", "TEXT");
+    this.ensureTaskColumn("fork_count", "INTEGER NOT NULL DEFAULT 0");
     this.db.prepare("INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)").run(1, Date.now());
   }
 
@@ -97,6 +99,8 @@ export class SqliteRepository {
       maxRetryCount: input.maxRetryCount ?? 3,
       retryCount: 0,
       conflictRetryCount: 0,
+      forkedFromThreadId: null,
+      forkCount: 0,
       nextRunAt: now,
       quotaResetAt: null,
       lastProgressHash: null,
@@ -117,6 +121,7 @@ export class SqliteRepository {
         use_reset_credit_on_weekly_limit,reset_credit_last_attempt_at,reset_credit_last_outcome,
         max_retry_count,retry_count,next_run_at,quota_reset_at,last_progress_hash,stagnant_cycle_count,
         last_quota_interrupted_at,last_quota_interrupted_thread_id,conflict_retry_count,
+        forked_from_thread_id,fork_count,
         created_at,updated_at,started_at,finished_at,last_error,branch_name,worktree_path
       ) VALUES (
         @id,@title,@mode,@project_path,@thread_id,@session_id,@original_goal,@resume_instruction,@acceptance_criteria,
@@ -125,6 +130,7 @@ export class SqliteRepository {
         @use_reset_credit_on_weekly_limit,@reset_credit_last_attempt_at,@reset_credit_last_outcome,
         @max_retry_count,@retry_count,@next_run_at,@quota_reset_at,@last_progress_hash,@stagnant_cycle_count,
         @last_quota_interrupted_at,@last_quota_interrupted_thread_id,@conflict_retry_count,
+        @forked_from_thread_id,@fork_count,
         @created_at,@updated_at,@started_at,@finished_at,@last_error,@branch_name,@worktree_path
       )
     `).run({
@@ -161,6 +167,8 @@ export class SqliteRepository {
       last_quota_interrupted_at: t.lastQuotaInterruptedAt,
       last_quota_interrupted_thread_id: t.lastQuotaInterruptedThreadId,
       conflict_retry_count: t.conflictRetryCount,
+      forked_from_thread_id: t.forkedFromThreadId,
+      fork_count: t.forkCount,
       created_at: t.createdAt,
       updated_at: t.updatedAt,
       started_at: t.startedAt,
@@ -270,6 +278,7 @@ export class SqliteRepository {
       "nextRunAt", "quotaResetAt", "lastProgressHash", "stagnantCycleCount", "startedAt", "finishedAt",
       "lastError", "branchName", "worktreePath", "resetCreditLastAttemptAt", "resetCreditLastOutcome",
       "lastQuotaInterruptedAt", "lastQuotaInterruptedThreadId", "conflictRetryCount",
+      "forkedFromThreadId", "forkCount",
     ] as const;
     const sets: string[] = [];
     const values: Record<string, string | number | null> = { task_id: taskId, updated_at: at };
@@ -481,6 +490,8 @@ function rowToTask(r: Row): ManagedTask {
     maxRetryCount: Number(r.max_retry_count),
     retryCount: Number(r.retry_count),
     conflictRetryCount: Number(r.conflict_retry_count ?? 0),
+    forkedFromThreadId: (r.forked_from_thread_id as string | null) ?? null,
+    forkCount: Number(r.fork_count ?? 0),
     nextRunAt: (r.next_run_at as number | null) ?? null,
     quotaResetAt: (r.quota_reset_at as number | null) ?? null,
     lastProgressHash: (r.last_progress_hash as string | null) ?? null,

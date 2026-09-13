@@ -120,6 +120,46 @@ test("quota: new columns are migrated and default to null", () => {
   r.close();
 });
 
+/* ------------------------------------------------------------------ *
+ * writer conflict 降级 fork：血缘字段
+ * ------------------------------------------------------------------ */
+
+test("fork: ancestry columns are migrated, default to null/0, and persist", () => {
+  const r = fresh();
+  const t = r.createTask({ title: "T", projectPath: "D:\\p", originalGoal: "g" });
+  assert.equal(t.forkedFromThreadId, null);
+  assert.equal(t.forkCount, 0);
+  const created = r.getTask(t.id);
+  assert.equal(created?.forkedFromThreadId, null);
+  assert.equal(created?.forkCount, 0);
+
+  // 撞写锁降级 fork 时写入的形态：线程换成子线程，血缘指向父线程
+  r.patch(t.id, {
+    threadId: "child-1",
+    sessionId: "child-1",
+    forkedFromThreadId: "parent-1",
+    forkCount: 1,
+    conflictRetryCount: 0,
+  });
+  const got = r.getTask(t.id);
+  assert.equal(got?.threadId, "child-1");
+  assert.equal(got?.forkedFromThreadId, "parent-1");
+  assert.equal(got?.forkCount, 1);
+  r.close();
+});
+
+test("fork: fork_count accumulates along a chained bloodline", () => {
+  const r = fresh();
+  const t = r.createTask({ title: "T", projectPath: "D:\\p", originalGoal: "g", threadId: "parent-1" });
+  r.patch(t.id, { threadId: "child-1", forkedFromThreadId: "parent-1", forkCount: 1 });
+  r.patch(t.id, { threadId: "child-2", forkedFromThreadId: "child-1", forkCount: 2 });
+  const got = r.getTask(t.id);
+  assert.equal(got?.threadId, "child-2");
+  assert.equal(got?.forkedFromThreadId, "child-1");
+  assert.equal(got?.forkCount, 2);
+  r.close();
+});
+
 test("quota: patch() can persist the interrupted thread + time", () => {
   const r = fresh();
   const t = r.createTask({ title: "T", projectPath: "D:\\p", originalGoal: "g" });

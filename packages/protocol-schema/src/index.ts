@@ -18,6 +18,7 @@ export type AppServerMethod =
   | "thread/resume"
   | "thread/read"
   | "thread/list"
+  | "thread/fork"
   | "turn/start"
   | "turn/interrupt";
 
@@ -184,6 +185,42 @@ export interface ThreadResumeParams {
   developerInstructions?: string | null;
   serviceTier?: string | null;
   config?: Record<string, unknown> | null;
+}
+
+/**
+ * thread/fork 参数（v0.153.4 实测：必填只有 threadId）。
+ *
+ * 语义：从已有线程派生一条**独立可写**的新线程。新线程通过血缘继承父线程的历史上下文，
+ * 但两条线程的 writer 互不相干 —— 因此当父线程正被**别的** Codex 进程（通常是常驻的桌面版）
+ * 持有写锁时，fork 依然可用。这正是 CAR 在 writer conflict 时的降级路径。
+ *
+ * excludeTurns 用于避免把父线程全量 turns 塞进响应（父线程 rollout 可达数 MB，
+ * 会撞 AppServerClient 的 maxMessageBytes）；血缘由服务端建立，与响应是否带 turns 无关。
+ */
+export interface ThreadForkParams {
+  threadId: string;
+  /** fork through, inclusive —— 只分叉到该 turn 为止；缺省则分叉到父线程末尾 */
+  lastTurnId?: string | null;
+  /** 响应中不返回 turns（只要新线程 id 时应开启） */
+  excludeTurns?: boolean | null;
+  cwd?: string | null;
+  model?: string | null;
+  sandbox?: SandboxMode | null;
+  approvalPolicy?: AskForApproval | null;
+  approvalsReviewer?: ApprovalsReviewer | null;
+}
+
+/** thread/fork 返回（实测：thread 即新线程，其 forkedFromId 指向父线程） */
+export interface ThreadForkResult {
+  thread?: {
+    id?: string;
+    sessionId?: string;
+    status?: { type?: string };
+    /** 父线程 id —— 血缘标记 */
+    forkedFromId?: string | null;
+    turns?: unknown[];
+  } | null;
+  [k: string]: unknown;
 }
 
 /** thread/read 参数 */

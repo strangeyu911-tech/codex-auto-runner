@@ -27,6 +27,8 @@ import type {
   JsonRpcServerRequest,
   AccountInfo,
   RateLimitsResult,
+  ThreadForkParams,
+  ThreadForkResult,
 } from "@car/protocol-schema";
 
 export interface AppServerClientOptions {
@@ -198,6 +200,30 @@ export class AppServerClient extends EventEmitter {
 
   async getRateLimits(): Promise<RateLimitsResult> {
     return this.request<RateLimitsResult>("account/rateLimits/read");
+  }
+
+  /**
+   * 从已有线程派生一条**独立可写**的新线程，返回新线程 id。
+   *
+   * 用途：当 `thread/resume` 撞上 writer conflict（父线程正被别的 Codex 进程持有写锁）时，
+   * 用 fork 换到一个归本 client 所有的线程继续跑，而不是傻等对方放锁。
+   *
+   * ⚠️ 调用约定：fork 之后**不要再对子线程发 `thread/resume`**。
+   * 创建它的 app-server（就是本 client）已经是它的 writer，直接 `turn/start` 即可；
+   * 多一次 resume 只会在同一个 server 里自造一次 ownership 冲突。
+   *
+   * 默认 `excludeTurns: true` —— 只需要子线程 id，父线程全量 turns 可达数 MB，
+   * 会撞 maxMessageBytes；血缘由服务端建立，与响应带不带 turns 无关。
+   */
+  async forkThread(parentThreadId: string, params?: Omit<ThreadForkParams, "threadId">): Promise<string> {
+    const resp = await this.request<ThreadForkResult>("thread/fork", {
+      threadId: parentThreadId,
+      excludeTurns: true,
+      ...params,
+    });
+    const id = resp?.thread?.id;
+    if (!id) throw new Error("thread/fork returned no thread.id");
+    return id;
   }
 
   /* ------------------------------- 内部 ------------------------------- */
@@ -372,6 +398,29 @@ function createDefaultLogger(): Logger {
     child() { return this; },
     trace() {}, debug() {}, info() {}, warn() {}, error() {}, fatal() {},
   } as unknown as Logger;
+}
+
+/**
+ * 判定错误是否为「线程写锁被别的 Codex 进程占用」（writer conflict）。
+ *
+ * 桌面版（Codex Desktop）与 CAR 各跑自己的 app-server、共享 `~/.codex`，
+ * 而 Codex 规定一条线程同一时刻只能有一个 writer。因此这类失败属于**环境冲突**而非任务失败：
+ * 会随对方进程/会话结束自愈，值得单独处理，不应计入任务自身的失败次数。
+ *
+ * 这是 fork 降级的**唯一触发门槛**：只有它返回 true 才允许 fork，
+ * 其余失败（未登录 / 线程不存在 / rollout 损坏 / 权限不足 / 协议版本不兼容）一律 fail closed。
+ *
+ * 覆盖三种实际表现：
+ *   - app-server 抛的 `thread ... already has an active writer`
+ *   - 同义的 `thread-store conflict`
+ *   - task-engine 在读线程状态时提前抛出的 `THREAD_ACTIVE_ELSEWHERE`
+ */
+export function isWriterConflict(message: string): boolean {
+  return (
+    /already has an active writer/i.test(message) ||
+    /thread-store conflict/i.test(message) ||
+    /THREAD_ACTIVE_ELSEWHERE/.test(message)
+  );
 }
 
 /** 随机实例标识，用于本工具唯一性（占位，单实例锁见 @car/persistence） */

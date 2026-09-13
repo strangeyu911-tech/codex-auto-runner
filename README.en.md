@@ -15,7 +15,9 @@ Codex Auto Runner is a local recovery runner for Codex goal sessions. It is buil
 
 It does not bypass limits. It prevents recovered quota from sitting idle.
 
-Just work in Codex as usual. Codex Auto Runner detects the session, records the task state, waits for quota recovery, verifies that quota is actually available, then resumes the same Codex thread so the model continues from its existing context.
+Just work in Codex as usual. Codex Auto Runner detects the session, records the task state, waits for quota recovery, verifies that quota is actually available, then resumes the original Codex thread so the model continues from its existing context.
+
+If another Codex process already holds that thread's writer lock — most often the resident Windows desktop app sitting in the tray — it does not sit and wait for the lock to be released. It forks a continuation branch off the original thread, preserving the same context and the task's bloodline.
 
 If the session has goal mode enabled, the runner also restores a quota-paused goal back to active. If it has no goal, the runner simply relies on the thread's own history — the work still does not lose its place.
 
@@ -28,14 +30,14 @@ Codex Auto Runner is an unofficial local companion for Codex. It is not an OpenA
 Use it if:
 
 - You often ask Codex to perform multi-hour migrations, repairs, reviews, or generation tasks.
-- You want the same thread to continue when quota recovers, regardless of whether that session has goal mode enabled.
+- You want the original thread to continue when quota recovers (forking an equivalent branch when its writer lock is held elsewhere), regardless of whether that session has goal mode enabled.
 - You want a local-only runner that stops when login, quota, approvals, validation, or human judgment is required.
 
 Do not use it if:
 
 - You want to bypass, expand, or modify Codex account limits.
 - You expect the runner to accept high-risk approvals, push code, or deploy automatically.
-- You are not using Windows Codex Desktop.
+- You are on macOS or Linux. The current implementation targets Windows only.
 
 If this solves your long-running Codex workflow, please star the repository so other heavy Codex users can find it.
 
@@ -55,7 +57,7 @@ Codex Auto Runner gives long-running Codex work a cross-window continuation loop
 
 ```text
 You are resuming a previously interrupted task via Codex Auto Runner.
-This is a continuation of the same session thread; your previous context is intact.
+This is a continuation of the previous session; your previous context is intact.
 
 Review what you were doing in this session and continue from where you stopped.
 Do not start over, do not open a new topic, do not re-ask for information you already have.
@@ -83,7 +85,7 @@ The core promise is simple: no blank new session, no lost context, no silent rec
 - **Quota-interrupt tracking**: records when each thread was last interrupted by the 5-hour or weekly quota. Interrupted threads are badged in the session list and selected first, so you do not have to hunt for them.
 - **Newest-interruption priority**: when several threads were interrupted by quota at once, the **most recently interrupted one** is resumed first. An explicitly set task priority still wins.
 - **Active-goal restoration**: restores paused, limited, or quota-stopped goals back to active before continuing.
-- **Same-thread resume**: resumes the original Codex thread so the model can continue from the existing context.
+- **Original-thread resume with writer-conflict fallback**: resumes the original Codex thread so the model can continue from the existing context; if that thread's writer lock is held by another Codex process, it forks a continuation branch that keeps the same context and bloodline.
 - **Reset-credit continuation**: when enabled by the user, can continue after weekly exhaustion if reset credits are available.
 - **Auto and Pro task creation**: Auto mode attaches to a Codex session with one click; Pro mode exposes priority, sandbox, approval, and validation settings.
 - **Quota overview**: shows the 5-hour and 1-week windows, remaining quota, refresh time, and task state.
@@ -123,7 +125,7 @@ codex-auto-runner/
     codex-resolver/       discovers and stages the Codex executable
     quota-engine/         quota bucket parsing and recovery-time logic
     persistence/          SQLite tasks, events, locks, and state machine
-    task-engine/          thread resume/start, goal activation, turn lifecycle
+    task-engine/          thread resume/start/fork, goal activation, turn lifecycle
     validator/            validation command runner
     git-guard/            repository safety checks before task execution
     logger/               structured logging and sensitive-field redaction
@@ -269,7 +271,7 @@ The core local loop is implemented:
 - Codex session discovery and goal-mode detection.
 - **Goal-less session resume**: threads without a goal can be taken over and continued across quota windows too.
 - **Quota-interrupt tracking and priority**: records the interrupted thread and time; when several overlap, the newest one is resumed first.
-- Same-thread resume and active-goal restoration.
+- Original-thread resume (forking a continuation branch on writer conflict) and active-goal restoration.
 - Auto task creation and Pro task configuration.
 - Local quota dashboard with Chinese and English UI.
 - Reset-credit continuation option after weekly exhaustion.

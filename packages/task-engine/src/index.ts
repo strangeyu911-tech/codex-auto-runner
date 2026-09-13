@@ -16,7 +16,7 @@
  *   turn/completed 通知 -> { threadId, turn:{ id, status:"completed"|"failed"|"interrupted", error? } }
  */
 
-import { AppServerClient } from "@car/app-server-client";
+import { AppServerClient, isWriterConflict } from "@car/app-server-client";
 import type { Logger } from "@car/logger";
 import { SqliteRepository } from "@car/persistence";
 import type { ManagedTask } from "@car/persistence";
@@ -40,6 +40,12 @@ export interface TaskEngineOptions {
   logger: Logger;
   /** 任务数据目录（检查点文件）。默认 %LOCALAPPDATA%\CodexAutoRunner\tasks */
   tasksDir?: string;
+  /**
+   * 单任务允许的最大 fork 次数（writer conflict 降级用）。默认 5。
+   *
+   * 超限后不再 fork，改为退避等待 —— 避免父线程被长期持锁时无限产出孤儿线程。
+   */
+  maxForksPerTask?: number;
 }
 
 /** 单回合执行结果 */
@@ -56,6 +62,7 @@ export class TaskEngine {
   private readonly repo: SqliteRepository;
   private readonly log: Logger;
   private readonly tasksDir: string;
+  private readonly maxForksPerTask: number;
 
   /** 当前等待中的回合：threadId -> resolve */
   private readonly pendingTurns = new Map<string, (o: TurnOutcome) => void>();
@@ -66,6 +73,7 @@ export class TaskEngine {
     this.log = opts.logger.child({ comp: "task-engine" });
     const local = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
     this.tasksDir = opts.tasksDir ?? join(local, "CodexAutoRunner", "tasks");
+    this.maxForksPerTask = opts.maxForksPerTask ?? 5;
     mkdirSync(this.tasksDir, { recursive: true });
 
     // 订阅通知
@@ -86,7 +94,8 @@ export class TaskEngine {
       this.repo.patch(task.id, { threadId, sessionId: threadId });
     } else {
       this.repo.transitionInTx(task.id, "PREPARING", "STARTING_THREAD");
-      await this.resumeThread(task, threadId);
+      // 返回值可能是原线程，也可能是撞上写锁后 fork 出来的子线程
+      threadId = await this.ensureWritableThread(task, threadId);
     }
 
     // 2. 启动回合
@@ -222,6 +231,83 @@ export class TaskEngine {
     await this.ensureGoalActive(threadId);
     await this.client.request("thread/resume", { threadId, approvalPolicy: this.approvalFor(task) });
     this.repo.appendEvent(task.id, "thread.resumed", { threadId, quotaInterrupted: probe.interrupted });
+  }
+
+  /**
+   * 拿到一条「本 client 可写」的线程 id。
+   *
+   * 先按常规 resume；仅当失败原因**确认为 writer conflict** 时，降级为 `thread/fork` ——
+   * 从父线程派生一条归本 client 所有的新线程继续跑。
+   *
+   * fail closed：非 writer conflict 的错误（未登录 / 线程不存在 / rollout 损坏 /
+   * 权限不足 / 协议版本不兼容）一律原样抛出，绝不 fork。分叉不是万能兜底，
+   * 把任意失败都升级成 fork 只会掩盖真实故障并产出一堆孤儿线程。
+   */
+  private async ensureWritableThread(task: ManagedTask, threadId: string): Promise<string> {
+    try {
+      await this.resumeThread(task, threadId);
+      return threadId;
+    } catch (e) {
+      const msg = String(e);
+      if (!isWriterConflict(msg)) throw e;
+      return await this.forkForWriterConflict(task, threadId, msg);
+    }
+  }
+
+  /**
+   * writer conflict 降级：fork 出子线程、立刻持久化，返回子线程 id。
+   *
+   * 关键约束（已实测踩过）：fork 必须与随后的 `turn/start` 发生在**同一个 app-server** 里。
+   * 创建子线程的那个 server 天然就是它的 writer，因此这里**不再对子线程 resume** ——
+   * 多一次 resume 只会在同一个 server 内自造一次 ownership 冲突。
+   * 等下一个额度窗口恢复时，`task.threadId` 已指向子线程，走正常 resume 路径即可。
+   *
+   * 崩溃窗口：fork 返回与落库之间若进程挂掉，子线程会成为孤儿（不会自动被接管）。
+   * 该窗口无法彻底消除（协议不支持 client 指定 thread id），只能① 返回后立即落库；
+   * ② 用 forkCount 封顶，避免反复产出。
+   */
+  private async forkForWriterConflict(task: ManagedTask, parentThreadId: string, cause: string): Promise<string> {
+    if (task.forkCount >= this.maxForksPerTask) {
+      // 保留 writer conflict 的判定特征字符串：让调度器仍按「环境冲突」退避，
+      // 而不是把它当成任务失败去烧 retryCount。
+      throw new Error(
+        `thread ${parentThreadId} already has an active writer; fork fallback exhausted ` +
+          `(forkCount=${task.forkCount}/${this.maxForksPerTask}); last cause: ${cause}`,
+      );
+    }
+
+    let childThreadId: string;
+    try {
+      childThreadId = await this.client.forkThread(parentThreadId);
+    } catch (e) {
+      // fork 也失败 —— 同样保留冲突语义，交回调度器指数退避
+      throw new Error(
+        `thread ${parentThreadId} already has an active writer; fork fallback failed: ${String(e)}`,
+      );
+    }
+
+    // 立即落库：这是 fork 与「崩溃丢孩子」之间仅有的一段可压缩窗口
+    this.repo.patch(task.id, {
+      threadId: childThreadId,
+      sessionId: childThreadId,
+      forkedFromThreadId: parentThreadId,
+      forkCount: task.forkCount + 1,
+      conflictRetryCount: 0,
+      lastError: null,
+    });
+    this.repo.appendEvent(task.id, "thread/fork.fallback", {
+      parentThreadId,
+      childThreadId,
+      forkCount: task.forkCount + 1,
+      cause,
+    });
+    this.log.warn("thread writer conflict; forked a writable branch instead", {
+      taskId: task.id,
+      parentThreadId,
+      childThreadId,
+      forkCount: task.forkCount + 1,
+    });
+    return childThreadId;
   }
 
   private async ensureGoalActive(threadId: string): Promise<void> {
@@ -392,7 +478,7 @@ export class TaskEngine {
   private buildResumePrompt(task: ManagedTask): string {
     const lines: string[] = [];
     lines.push("你正在被 Codex Auto Runner 恢复执行一个之前中断的任务。");
-    lines.push("这是同一个会话线程的延续，你之前的历史上下文都还在。");
+    lines.push("这是之前会话的延续，你之前的历史上下文都还在。");
     lines.push("");
     lines.push("请先回顾本会话中你上一次正在做的事，从中断的地方继续推进。");
     lines.push("不要重头开始，不要开启新话题，不要重复询问已经得到过的信息。");

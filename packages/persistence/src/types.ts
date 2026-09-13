@@ -60,6 +60,23 @@ export interface ManagedTask {
    */
   conflictRetryCount: number;
 
+  /**
+   * fork 血缘：当前 threadId 是从哪条线程 fork 出来的（null = 原生线程，非分叉产物）。
+   *
+   * 仅在 writer conflict 降级时写入。保留它有两个用途：
+   *   ① 事后追溯一条任务的线程血缘链（A -> B -> C -> …）；
+   *   ② 定位并清理「fork 成功但没能接管」留下的孤儿线程。
+   */
+  forkedFromThreadId: string | null;
+
+  /**
+   * 本任务累计 fork 次数，给「撞锁 -> fork」加一道上限。
+   *
+   * 若无上限，且父线程被长期持锁、每次都在同一处失败，任务会不断产出新线程。
+   * 达到上限后不再 fork，转为退避等待 —— 宁可停住，也不要造出一长串孤儿。
+   */
+  forkCount: number;
+
   nextRunAt: number | null;
   quotaResetAt: number | null;
   lastProgressHash: string | null;

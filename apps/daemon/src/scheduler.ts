@@ -10,7 +10,9 @@
  *   额度耗尽  -> WAITING_QUOTA（由 TaskEngine 内部已处理状态转换）
  *   认证失效  -> WAITING_AUTH
  *   其他失败  -> FAILED_RETRYABLE，按退避重排
- *   写锁冲突  -> FAILED_RETRYABLE，指数退避且**不消耗 retryCount**（见 isWriterConflict）
+ *   写锁冲突  -> TaskEngine 内部先降级 fork 出一条新线程继续（见 ensureWritableThread）；
+ *                只有 fork 也失败 / 超出 forkCount 上限时才落到这里：
+ *                FAILED_RETRYABLE + 指数退避，且**不消耗 retryCount**（见 isWriterConflict）
  *
  * 重试闭环（第 7 项）：
  *   上面所有失败都落在 FAILED_RETRYABLE，而 claimNextRunnable 只认 READY，
@@ -18,7 +20,7 @@
  *   否则任务一撞就死、永远需要人工 resume。
  */
 
-import { AppServerClient } from "@car/app-server-client";
+import { AppServerClient, isWriterConflict } from "@car/app-server-client";
 import type { Logger } from "@car/logger";
 import { SqliteRepository } from "@car/persistence";
 import type { ManagedTask } from "@car/persistence";
@@ -235,6 +237,7 @@ export class Scheduler {
       if (cur && ["PREPARING", "STARTING_THREAD", "RUNNING", "VERIFYING"].includes(cur.status)) {
         this.repo.forceStatus(task.id, "FAILED_RETRYABLE");
         if (isWriterConflict(msg)) {
+          // 走到这里说明引擎侧的 fork 降级已尝试过但仍未解决（fork 被拒 / fork 次数用尽）。
           // 写锁冲突：另一个 Codex 进程（通常是常驻的桌面版）正持有该线程的 writer。
           // 这不是任务的失败，因此**不消耗 retryCount**，改用独立计数 + 指数退避，
           // 等对方放锁后由 promoteRetryableTasks() 自动接上。
@@ -311,25 +314,10 @@ export function writerConflictBackoffMs(attempt: number): number {
   return Math.min(WRITER_CONFLICT_BASE_MS * 2 ** (n - 1), WRITER_CONFLICT_MAX_MS);
 }
 
-/**
- * 判定错误是否为「线程写锁被别的 Codex 进程占用」。
- *
- * 桌面版（Codex Desktop）与 CAR（codex_auto_runner）各跑自己的 app-server、共享 `~/.codex`，
- * 而 Codex 规定一条线程同一时刻只能有一个 writer。因此这类失败属于环境冲突：
- * 会随对方进程/会话结束自愈，值得单独退避重试，不应该计入任务自身的失败次数。
- *
- * 覆盖三种实际表现：
- *   - daemon 侧 app-server 抛的 `thread ... already has an active writer`
- *   - 同义的 `thread-store conflict`
- *   - task-engine 在读线程状态时提前抛出的 `THREAD_ACTIVE_ELSEWHERE`
- */
-export function isWriterConflict(message: string): boolean {
-  return (
-    /already has an active writer/i.test(message) ||
-    /thread-store conflict/i.test(message) ||
-    /THREAD_ACTIVE_ELSEWHERE/.test(message)
-  );
-}
+// isWriterConflict 已下沉到 @car/app-server-client —— TaskEngine 的 fork 降级要用同一判定，
+// 两处必须口径一致，否则会出现「引擎认为该 fork、调度器认为该烧 retryCount」的错位。
+// 这里 re-export，保持既有 import 路径（含 scheduler-retry.test.ts）不变。
+export { isWriterConflict };
 
 function isWeeklyLimitExhausted(quota: QuotaSnapshot): boolean {
   return quota.blockingBuckets.some((b) => {
