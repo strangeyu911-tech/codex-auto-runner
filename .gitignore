@@ -45,3 +45,19 @@ packages/**/test/**/*.d.ts.map
 tools/fixtures/app-server/
 tools/fixtures/app-server/*.json
 tools/fixtures/live-test-repo/
+
+# Local audit working material: review notes, exported session comparisons and
+# machine backups. Contains private session data and full local path listings,
+# so it must never be published.
+_audit/
+
+# Machine-specific launcher and one-off local helper scripts.
+# These carry absolute local paths and are regenerated per machine.
+start-daemon.cmd
+tocrlf.cjs
+
+# TypeScript sidecar output emitted beside root-level test files during local checks
+test/**/*.js
+test/**/*.js.map
+test/**/*.d.ts
+test/**/*.d.ts.map
