@@ -58,6 +58,7 @@ export class SqliteRepository {
     this.ensureTaskColumn("reset_credit_last_outcome", "TEXT");
     this.ensureTaskColumn("last_quota_interrupted_at", "INTEGER");
     this.ensureTaskColumn("last_quota_interrupted_thread_id", "TEXT");
+    this.ensureTaskColumn("conflict_retry_count", "INTEGER NOT NULL DEFAULT 0");
     this.db.prepare("INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)").run(1, Date.now());
   }
 
@@ -95,6 +96,7 @@ export class SqliteRepository {
       resetCreditLastOutcome: null,
       maxRetryCount: input.maxRetryCount ?? 3,
       retryCount: 0,
+      conflictRetryCount: 0,
       nextRunAt: now,
       quotaResetAt: null,
       lastProgressHash: null,
@@ -114,7 +116,7 @@ export class SqliteRepository {
         validation_commands,max_run_cycles,run_cycle_count,max_quota_cycles,quota_cycle_count,
         use_reset_credit_on_weekly_limit,reset_credit_last_attempt_at,reset_credit_last_outcome,
         max_retry_count,retry_count,next_run_at,quota_reset_at,last_progress_hash,stagnant_cycle_count,
-        last_quota_interrupted_at,last_quota_interrupted_thread_id,
+        last_quota_interrupted_at,last_quota_interrupted_thread_id,conflict_retry_count,
         created_at,updated_at,started_at,finished_at,last_error,branch_name,worktree_path
       ) VALUES (
         @id,@title,@mode,@project_path,@thread_id,@session_id,@original_goal,@resume_instruction,@acceptance_criteria,
@@ -122,7 +124,7 @@ export class SqliteRepository {
         @validation_commands,@max_run_cycles,@run_cycle_count,@max_quota_cycles,@quota_cycle_count,
         @use_reset_credit_on_weekly_limit,@reset_credit_last_attempt_at,@reset_credit_last_outcome,
         @max_retry_count,@retry_count,@next_run_at,@quota_reset_at,@last_progress_hash,@stagnant_cycle_count,
-        @last_quota_interrupted_at,@last_quota_interrupted_thread_id,
+        @last_quota_interrupted_at,@last_quota_interrupted_thread_id,@conflict_retry_count,
         @created_at,@updated_at,@started_at,@finished_at,@last_error,@branch_name,@worktree_path
       )
     `).run({
@@ -158,6 +160,7 @@ export class SqliteRepository {
       stagnant_cycle_count: t.stagnantCycleCount,
       last_quota_interrupted_at: t.lastQuotaInterruptedAt,
       last_quota_interrupted_thread_id: t.lastQuotaInterruptedThreadId,
+      conflict_retry_count: t.conflictRetryCount,
       created_at: t.createdAt,
       updated_at: t.updatedAt,
       started_at: t.startedAt,
@@ -183,6 +186,25 @@ export class SqliteRepository {
     const rows = this.db
       .prepare(`SELECT * FROM tasks WHERE use_reset_credit_on_weekly_limit = 1 AND status IN ('WAITING_QUOTA','READY','NEEDS_CONTINUE') ORDER BY priority DESC, updated_at ASC`)
       .all() as Row[];
+    return rows.map(rowToTask);
+  }
+
+  /**
+   * 到期可重试的 FAILED_RETRYABLE 任务（nextRunAt 已过或为空）。
+   *
+   * 调度器在每次 tick 的开头用它做「自动提升」：FAILED_RETRYABLE -> READY。
+   * 背景：claimNextRunnable 只认 READY，而失败后的落点是 FAILED_RETRYABLE，
+   * 且没有任何自动出边 —— 缺这一步，撞锁 / 瞬时失败的任务永远不会自愈，
+   * 只能靠人工打 /api/tasks/:id/resume。
+   */
+  listRetryableDue(now = Date.now()): ManagedTask[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM tasks
+          WHERE status = 'FAILED_RETRYABLE' AND (next_run_at IS NULL OR next_run_at <= ?)
+          ORDER BY priority DESC, updated_at ASC`,
+      )
+      .all(now) as Row[];
     return rows.map(rowToTask);
   }
 
@@ -247,7 +269,7 @@ export class SqliteRepository {
       "threadId", "sessionId", "runCycleCount", "quotaCycleCount", "retryCount",
       "nextRunAt", "quotaResetAt", "lastProgressHash", "stagnantCycleCount", "startedAt", "finishedAt",
       "lastError", "branchName", "worktreePath", "resetCreditLastAttemptAt", "resetCreditLastOutcome",
-      "lastQuotaInterruptedAt", "lastQuotaInterruptedThreadId",
+      "lastQuotaInterruptedAt", "lastQuotaInterruptedThreadId", "conflictRetryCount",
     ] as const;
     const sets: string[] = [];
     const values: Record<string, string | number | null> = { task_id: taskId, updated_at: at };
@@ -458,6 +480,7 @@ function rowToTask(r: Row): ManagedTask {
     resetCreditLastOutcome: (r.reset_credit_last_outcome as string | null) ?? null,
     maxRetryCount: Number(r.max_retry_count),
     retryCount: Number(r.retry_count),
+    conflictRetryCount: Number(r.conflict_retry_count ?? 0),
     nextRunAt: (r.next_run_at as number | null) ?? null,
     quotaResetAt: (r.quota_reset_at as number | null) ?? null,
     lastProgressHash: (r.last_progress_hash as string | null) ?? null,

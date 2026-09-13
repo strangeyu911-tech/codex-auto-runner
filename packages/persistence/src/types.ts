@@ -50,6 +50,16 @@ export interface ManagedTask {
   maxRetryCount: number;
   retryCount: number;
 
+  /**
+   * 「外部冲突」退避计数，与 retryCount 分开计。
+   *
+   * 撞上别的 Codex 进程持有的线程写锁（桌面版与 CAR 各跑自己的 app-server、共享 ~/.codex）
+   * 属于环境冲突，不是任务自身失败 —— 消耗 maxRetryCount 会导致任务在用户还没来得及
+   * 关掉桌面版那条线程时就「重试耗尽」变成 FAILED_FINAL。因此单独计数、指数退避，
+   * 一直等到对方放锁为止。
+   */
+  conflictRetryCount: number;
+
   nextRunAt: number | null;
   quotaResetAt: number | null;
   lastProgressHash: string | null;

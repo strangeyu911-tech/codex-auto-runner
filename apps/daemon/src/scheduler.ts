@@ -10,6 +10,12 @@
  *   额度耗尽  -> WAITING_QUOTA（由 TaskEngine 内部已处理状态转换）
  *   认证失效  -> WAITING_AUTH
  *   其他失败  -> FAILED_RETRYABLE，按退避重排
+ *   写锁冲突  -> FAILED_RETRYABLE，指数退避且**不消耗 retryCount**（见 isWriterConflict）
+ *
+ * 重试闭环（第 7 项）：
+ *   上面所有失败都落在 FAILED_RETRYABLE，而 claimNextRunnable 只认 READY，
+ *   于是 tick() 开头先把**到期的** FAILED_RETRYABLE 提升回 READY，
+ *   否则任务一撞就死、永远需要人工 resume。
  */
 
 import { AppServerClient } from "@car/app-server-client";
@@ -104,10 +110,48 @@ export class Scheduler {
     const task = this.repo.getTask(taskId);
     if (!task) throw new Error("task not found: " + taskId);
     // 强制改为 READY 以便 claim
-    if (task.status === "READY" || task.status === "NEEDS_CONTINUE" || task.status === "WAITING_QUOTA" || task.status === "WAITING_SCHEDULE") {
+    if (task.status === "READY" || task.status === "NEEDS_CONTINUE" || task.status === "WAITING_QUOTA" || task.status === "WAITING_SCHEDULE" || task.status === "FAILED_RETRYABLE") {
       this.repo.forceStatus(taskId, "READY");
     }
     await this.tick();
+  }
+
+  /**
+   * 把**到期的** FAILED_RETRYABLE 任务推回 READY，使其重新进入 claim 队列。
+   *
+   * - 普通失败：失败时 retryCount 已 +1；这里只做「到期放行」。真的用光了
+   *   （retryCount >= maxRetryCount）就落 FAILED_FINAL —— 终态、UI 可见，
+   *   不再无声地挂在 FAILED_RETRYABLE 上。
+   * - 写锁冲突：conflictRetryCount 单独计，不受 maxRetryCount 约束，
+   *   按指数退避一直重试到对方（桌面版）放锁为止 —— 这正是「用户关掉桌面版那一刻自动补跑」。
+   */
+  private promoteRetryableTasks(): number {
+    const due = this.repo.listRetryableDue();
+    let promoted = 0;
+    for (const t of due) {
+      if (t.retryCount >= t.maxRetryCount) {
+        this.repo.forceStatus(t.id, "FAILED_FINAL");
+        this.repo.patch(t.id, { nextRunAt: null });
+        this.repo.appendEvent(t.id, "retry/exhausted", {
+          retryCount: t.retryCount,
+          maxRetryCount: t.maxRetryCount,
+          lastError: t.lastError,
+        });
+        this.log.warn("retry budget exhausted -> FAILED_FINAL", { taskId: t.id, retryCount: t.retryCount });
+        continue;
+      }
+      this.repo.forceStatus(t.id, "READY");
+      // nextRunAt 置空：既然已经到期，就别再让旧时间戳把 claim 挡住
+      this.repo.patch(t.id, { nextRunAt: null });
+      this.repo.appendEvent(t.id, "retry/promoted", {
+        retryCount: t.retryCount,
+        conflictRetryCount: t.conflictRetryCount,
+        lastError: t.lastError,
+      });
+      promoted++;
+    }
+    if (promoted) this.log.info("promoted FAILED_RETRYABLE tasks back to READY", { count: promoted });
+    return promoted;
   }
 
   private scheduleTick(delay: number): void {
@@ -143,6 +187,10 @@ export class Scheduler {
         }
         // available / near_limit -> 继续
       }
+
+      // 自动提升：到期的 FAILED_RETRYABLE -> READY。
+      // claimNextRunnable 只认 READY，缺这一步则「撞锁 / 瞬时失败」的任务永不重试。
+      this.promoteRetryableTasks();
 
       // 认领最高优先级
       const task = this.repo.claimNextRunnable();
@@ -180,12 +228,33 @@ export class Scheduler {
       const outcome = await this.engine.runOneTurn(task);
       log.info("turn outcome", { status: outcome.status });
     } catch (e) {
-      log.error("runOneTurn threw", { err: String(e) });
+      const msg = String(e);
+      log.error("runOneTurn threw", { err: msg });
       // 兜底：如果还停在 RUNNING/VERIFYING 等，推进到 FAILED_RETRYABLE
       const cur = this.repo.getTask(task.id);
       if (cur && ["PREPARING", "STARTING_THREAD", "RUNNING", "VERIFYING"].includes(cur.status)) {
         this.repo.forceStatus(task.id, "FAILED_RETRYABLE");
-        this.repo.patch(task.id, { lastError: String(e), retryCount: cur.retryCount + 1, nextRunAt: Date.now() + 60_000 });
+        if (isWriterConflict(msg)) {
+          // 写锁冲突：另一个 Codex 进程（通常是常驻的桌面版）正持有该线程的 writer。
+          // 这不是任务的失败，因此**不消耗 retryCount**，改用独立计数 + 指数退避，
+          // 等对方放锁后由 promoteRetryableTasks() 自动接上。
+          const attempt = cur.conflictRetryCount + 1;
+          const delayMs = writerConflictBackoffMs(attempt);
+          this.repo.patch(task.id, {
+            lastError: msg,
+            conflictRetryCount: attempt,
+            nextRunAt: Date.now() + delayMs,
+          });
+          this.repo.appendEvent(task.id, "retry/deferred-writer-conflict", {
+            attempt,
+            delayMs,
+            threadId: cur.threadId ?? cur.lastQuotaInterruptedThreadId ?? null,
+            error: msg,
+          });
+          log.warn("thread writer conflict; backing off instead of burning retries", { attempt, delayMs, err: msg });
+        } else {
+          this.repo.patch(task.id, { lastError: msg, retryCount: cur.retryCount + 1, nextRunAt: Date.now() + 60_000 });
+        }
       }
     } finally {
       this.repo.releaseProjectLock(task.projectPath);
@@ -231,6 +300,35 @@ export class Scheduler {
       return false;
     }
   }
+}
+
+/** 写锁冲突的指数退避：60s → 120s → 240s → 480s …，上限 15 分钟 */
+const WRITER_CONFLICT_BASE_MS = 60_000;
+const WRITER_CONFLICT_MAX_MS = 15 * 60_000;
+
+export function writerConflictBackoffMs(attempt: number): number {
+  const n = Math.max(1, Math.floor(attempt));
+  return Math.min(WRITER_CONFLICT_BASE_MS * 2 ** (n - 1), WRITER_CONFLICT_MAX_MS);
+}
+
+/**
+ * 判定错误是否为「线程写锁被别的 Codex 进程占用」。
+ *
+ * 桌面版（Codex Desktop）与 CAR（codex_auto_runner）各跑自己的 app-server、共享 `~/.codex`，
+ * 而 Codex 规定一条线程同一时刻只能有一个 writer。因此这类失败属于环境冲突：
+ * 会随对方进程/会话结束自愈，值得单独退避重试，不应该计入任务自身的失败次数。
+ *
+ * 覆盖三种实际表现：
+ *   - daemon 侧 app-server 抛的 `thread ... already has an active writer`
+ *   - 同义的 `thread-store conflict`
+ *   - task-engine 在读线程状态时提前抛出的 `THREAD_ACTIVE_ELSEWHERE`
+ */
+export function isWriterConflict(message: string): boolean {
+  return (
+    /already has an active writer/i.test(message) ||
+    /thread-store conflict/i.test(message) ||
+    /THREAD_ACTIVE_ELSEWHERE/.test(message)
+  );
 }
 
 function isWeeklyLimitExhausted(quota: QuotaSnapshot): boolean {
