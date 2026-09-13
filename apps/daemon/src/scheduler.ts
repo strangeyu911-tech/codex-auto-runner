@@ -214,6 +214,16 @@ export class Scheduler {
       }
       if (this.repo.hasRunningTask()) return;
 
+      // 会话自动发现：把「被额度打断、但 CAR 还不知道」的桌面版会话接进队列。
+      //
+      // 刻意放在额度闸门**之前**。扫描只有 thread/list + thread/read（只读、不吃额度），
+      // 而「被额度打断」恰恰发生在额度 exhausted 的那段时间里 —— 闸门一放
+      // return，发现逻辑在最该干活的场景下反而一次都不跑，注释声称的行为和实际对不上。
+      // 放在闸门之前没有副作用：新任务落库就是 READY，额度恢复那刻已经在队列里等着了。
+      // 仍然留在 hasRunningTask() 之后：已有 turn 在跑时不去额外压 app-server，
+      // 反正同一时刻也只能跑一个任务，晚一轮接管不吃亏。
+      await this.maybeDiscover();
+
       // 额度检查
       const quota = this.getQuotaSnapshot();
       if (quota) {
@@ -231,10 +241,6 @@ export class Scheduler {
         }
         // available / near_limit -> 继续
       }
-
-      // 会话自动发现：把「被额度打断、但 CAR 还不知道」的桌面版会话接进队列。
-      // 放在 promote 之前，本轮新发现的任务同一 tick 就能参与 claim。
-      await this.maybeDiscover();
 
       // 自动提升：到期的 FAILED_RETRYABLE -> READY。
       // claimNextRunnable 只认 READY，缺这一步则「撞锁 / 瞬时失败」的任务永不重试。

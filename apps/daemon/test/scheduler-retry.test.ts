@@ -36,13 +36,31 @@ function makeProject(): string {
 
 function makeScheduler(
   repo: SqliteRepository,
-  opts: { onTurn?: (taskId: string) => Promise<unknown> } = {},
-): { scheduler: Scheduler; calls: string[] } {
+  opts: {
+    onTurn?: (taskId: string) => Promise<unknown>;
+    /** 顶掉默认替身：自动发现相关的用例需要真实的 thread/list + thread/read 应答 */
+    client?: AppServerClient;
+    /** 额度快照替身；默认 available（即「额度闸门不拦」） */
+    quota?: QuotaSnapshot;
+  } = {},
+): { scheduler: Scheduler; calls: string[]; rpcCalls: string[] } {
   const calls: string[] = [];
-  const client = {
+  const rpcCalls: string[] = [];
+  const client = opts.client ?? ({
     isHealthy: () => true,
     request: async () => {
       throw new Error("unexpected rpc in scheduler test");
+    },
+  } as unknown as AppServerClient);
+  // 记录所有出站 RPC —— 「额度耗尽时是否仍然扫描会话」只能从这里看出来
+  const rawRequest = (client as unknown as {
+    request: (m: string, p?: Record<string, unknown>) => Promise<unknown>;
+  }).request.bind(client);
+  const recorded = {
+    isHealthy: () => true,
+    request: (m: string, p?: Record<string, unknown>) => {
+      rpcCalls.push(m);
+      return rawRequest(m, p);
     },
   } as unknown as AppServerClient;
   const engine = {
@@ -52,16 +70,16 @@ function makeScheduler(
       return { status: "completed" };
     },
   } as unknown as TaskEngine;
-  const quota = { status: "available", blockingBuckets: [] } as unknown as QuotaSnapshot;
+  const quota = opts.quota ?? ({ status: "available", blockingBuckets: [] } as unknown as QuotaSnapshot);
   const scheduler = new Scheduler({
-    client,
+    client: recorded,
     repo,
     engine,
     logger: createLogger({ level: "error" }),
     isAutoRunEnabled: () => true,
     getQuotaSnapshot: () => quota,
   });
-  return { scheduler, calls };
+  return { scheduler, calls, rpcCalls };
 }
 
 function setup(): { repo: SqliteRepository; project: string } {
@@ -187,6 +205,88 @@ test("backoff: 60s, 120s, 240s … capped at 15 minutes", () => {
   assert.equal(writerConflictBackoffMs(8), 15 * 60_000);
   assert.equal(writerConflictBackoffMs(99), 15 * 60_000);
   assert.equal(writerConflictBackoffMs(0), 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// 自动发现 与 额度闸门 的顺序回归
+//
+// tick() 里 maybeDiscover() 必须排在额度闸门**之前**。否则额度 exhausted 时
+// tick 早在闸门处 return 了，而「被额度打断」恰恰就发生在那个状态里 ——
+// 功能会在自己注释点名的场景下静默失效（且单元测试全是 available，看不出来）。
+// ---------------------------------------------------------------------------
+
+const QUOTA_DEAD_TURNS = [
+  { id: "t1", status: "failed", error: { codexErrorInfo: "usageLimitExceeded", message: "usage limit reached" } },
+];
+
+const EXHAUSTED_QUOTA = {
+  status: "exhausted",
+  blockingBuckets: ["codex"],
+  resetCreditsAvailable: 0,
+} as unknown as QuotaSnapshot;
+
+/** 应答 thread/list + thread/read，返回一条「最后一个 turn 死于额度」的会话 */
+function makeDiscoveryClient(cwd: string, threadId = "thread-interrupted"): AppServerClient {
+  return {
+    isHealthy: () => true,
+    async request(method: string) {
+      if (method === "thread/list") {
+        return {
+          data: [{ id: threadId, cwd, updatedAt: Date.now(), status: { type: "idle" }, name: "interrupted session" }],
+        };
+      }
+      if (method === "thread/read") return { thread: { turns: QUOTA_DEAD_TURNS } };
+      throw new Error("unexpected rpc in scheduler test: " + method);
+    },
+  } as unknown as AppServerClient;
+}
+
+test("discovery: an exhausted bucket still gets its sessions scanned and queued", async () => {
+  const { repo, project } = setup();
+  const { scheduler, rpcCalls } = makeScheduler(repo, {
+    client: makeDiscoveryClient(project),
+    quota: EXHAUSTED_QUOTA,
+  });
+  await scheduler.tick();
+
+  assert.ok(
+    rpcCalls.includes("thread/list"),
+    "discovery must run before the quota gate returns early",
+  );
+  const adopted = repo.listTasks().filter((t) => t.title.startsWith("Auto-resume:"));
+  assert.equal(adopted.length, 1, "the quota-interrupted session should be queued even while blocked");
+  assert.equal(adopted[0].status, "READY", "a discovered task is claimable the moment quota returns");
+  assert.equal(adopted[0].mode, "resume_thread");
+  assert.equal(adopted[0].threadId, "thread-interrupted");
+  repo.close();
+});
+
+test("quota gate: an exhausted bucket still refuses to run an already-queued task", async () => {
+  const { repo, project } = setup();
+  const t = repo.createTask({
+    title: "queued while blocked", projectPath: project, originalGoal: "g", priority: 50,
+  });
+
+  const { scheduler, calls } = makeScheduler(repo, { quota: EXHAUSTED_QUOTA });
+  await scheduler.tick();
+
+  assert.deepEqual(calls, [], "must not burn quota on a turn while the bucket is exhausted");
+  assert.equal(repo.getTask(t.id)?.status, "READY", "stays queued for the recovery tick");
+  repo.close();
+});
+
+test("discovery: a failing scan must not break the scheduling loop", async () => {
+  const { repo, project } = setup();
+  const t = repo.createTask({
+    title: "still runs", projectPath: project, originalGoal: "g", priority: 50,
+  });
+
+  // 默认替身对任何 RPC 都抛错 —— 发现扫描会撞上它，但 tick 必须照常走到 claim
+  const { scheduler, calls } = makeScheduler(repo);
+  await scheduler.tick();
+
+  assert.deepEqual(calls, [t.id], "discovery errors are swallowed; the task still runs");
+  repo.close();
 });
 
 after(() => {
