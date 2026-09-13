@@ -5,6 +5,7 @@
  *   单实例锁 → 解析 codex → 启动 app-server → 打开/迁移 DB
  *   → 恢复扫描（RECOVERING）→ QuotaWatcher 监测额度
  *   → Scheduler 周期 tick + 额度恢复后立即 tick
+ *   → 会话自动发现：撞限额的桌面版会话自动建任务接管（可 CAR_DISCOVERY=0 关闭）
  *   → 额度可用且无 RUNNING 任务 → claim 最高优先级 → runOneTurn
  *   → 额度耗尽 -> WAITING_QUOTA + 检查点 → 等恢复 → 续跑
  *
@@ -13,6 +14,8 @@
  *   CAR_LOG_LEVEL=debug          细查
  *   CAR_DAEMON_TICK_MS=30000     scheduler 周期（默认 30s）
  *   CAR_DATA_DIR=...             覆盖数据目录
+ *   CAR_DISCOVERY=0              关闭会话自动发现
+ *   CAR_DISCOVERY_INTERVAL_MS   自动发现扫描间隔（默认 60s）
  */
 
 import { resolveCodex } from "@car/codex-resolver";
@@ -114,6 +117,12 @@ async function main(): Promise<void> {
     isAutoRunEnabled: () => autoRun,
     getQuotaSnapshot: () => latestQuota,
     refreshQuotaSnapshot: () => watcher.refresh(),
+    discovery: {
+      // 会话自动发现：把「被额度打断、CAR 还不知道」的桌面版会话自动接进队列。
+      // CAR_DISCOVERY=0 可整体关掉（默认开）。
+      enabled: process.env.CAR_DISCOVERY !== "0",
+      intervalMs: Number(process.env.CAR_DISCOVERY_INTERVAL_MS ?? 60_000),
+    },
   });
 
   // QuotaWatcher

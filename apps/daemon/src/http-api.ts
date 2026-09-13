@@ -26,6 +26,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { SqliteRepository, TERMINAL_STATUSES, type CreateTaskInput, type ManagedTask } from "@car/persistence";
+import { toMillis } from "./time.js";
 import type { QuotaSnapshot } from "@car/quota-engine";
 import type { Logger } from "@car/logger";
 import type { AppServerClient } from "@car/app-server-client";
@@ -346,8 +347,8 @@ async function listCodexSessions(
       preview: readString(t, "preview") ?? "",
       cwd: readString(t, "cwd"),
       source: readString(t, "source"),
-      updatedAt: readNumber(t, "updatedAt"),
-      createdAt: readNumber(t, "createdAt"),
+      updatedAt: toMillis(readNumber(t, "updatedAt")),
+      createdAt: toMillis(readNumber(t, "createdAt")),
       status: readNestedString(t, "status", "type") ?? "unknown",
       loaded: loadedIds.has(id),
       goal,

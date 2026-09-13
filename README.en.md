@@ -31,6 +31,7 @@ Use it if:
 
 - You often ask Codex to perform multi-hour migrations, repairs, reviews, or generation tasks.
 - You want the original thread to continue when quota recovers (forking an equivalent branch when its writer lock is held elsewhere), regardless of whether that session has goal mode enabled.
+- You want quota-interrupted sessions adopted automatically, without having to pick a thread yourself.
 - You want a local-only runner that stops when login, quota, approvals, validation, or human judgment is required.
 
 Do not use it if:
@@ -83,6 +84,7 @@ The core promise is simple: no blank new session, no lost context, no silent rec
 - **Weekly quota drive mode**: keeps a task moving across multiple 5-hour recoveries until the weekly quota is exhausted.
 - **Session discovery and goal detection**: discovers Codex sessions and flags which ones have goal mode enabled. **Sessions without a goal can still be resumed**, relying on the thread's own history.
 - **Quota-interrupt tracking**: records when each thread was last interrupted by the 5-hour or weekly quota. Interrupted threads are badged in the session list and selected first, so you do not have to hunt for them.
+- **Automatic session adoption**: periodically scans Codex sessions and creates a task for any thread whose latest turn actually died on quota and is not yet adopted — so you do not have to pick a thread after hitting the limit. Only genuinely quota-limited sessions are picked; normal completions, manual interrupts, and previously cancelled ones are left alone. Enabled by default; set `CAR_DISCOVERY=0` to turn it off.
 - **Newest-interruption priority**: when several threads were interrupted by quota at once, the **most recently interrupted one** is resumed first. An explicitly set task priority still wins.
 - **Active-goal restoration**: restores paused, limited, or quota-stopped goals back to active before continuing.
 - **Original-thread resume with writer-conflict fallback**: resumes the original Codex thread so the model can continue from the existing context; if that thread's writer lock is held by another Codex process, it forks a continuation branch that keeps the same context and bloodline.
@@ -271,6 +273,7 @@ The core local loop is implemented:
 - Codex session discovery and goal-mode detection.
 - **Goal-less session resume**: threads without a goal can be taken over and continued across quota windows too.
 - **Quota-interrupt tracking and priority**: records the interrupted thread and time; when several overlap, the newest one is resumed first.
+- **Automatic session adoption**: quota-interrupted sessions are detected and adopted without manual thread picking.
 - Original-thread resume (forking a continuation branch on writer conflict) and active-goal restoration.
 - Auto task creation and Pro task configuration.
 - Local quota dashboard with Chinese and English UI.

@@ -27,6 +27,7 @@ import type { ManagedTask } from "@car/persistence";
 import { TaskEngine } from "@car/task-engine";
 import { prepareForRun } from "@car/git-guard";
 import type { QuotaSnapshot } from "@car/quota-engine";
+import { DEFAULT_DISCOVERY, runDiscovery, type DiscoveryConfig } from "./discovery.js";
 import { randomUUID } from "node:crypto";
 
 export interface SchedulerOptions {
@@ -37,6 +38,11 @@ export interface SchedulerOptions {
   isAutoRunEnabled: () => boolean;
   getQuotaSnapshot: () => QuotaSnapshot | null;
   refreshQuotaSnapshot?: () => Promise<QuotaSnapshot | null>;
+  /**
+   * 会话自动发现：把「被额度打断、但 CAR 还不知道」的桌面版会话自动接进来。
+   * 不传则用 DEFAULT_DISCOVERY（默认启用）。
+   */
+  discovery?: Partial<DiscoveryConfig>;
 }
 
 export class Scheduler {
@@ -47,6 +53,8 @@ export class Scheduler {
   private readonly isAutoRunEnabled: () => boolean;
   private readonly getQuotaSnapshot: () => QuotaSnapshot | null;
   private readonly refreshQuotaSnapshot?: () => Promise<QuotaSnapshot | null>;
+  private readonly discoveryCfg: DiscoveryConfig;
+  private lastDiscoveryAt = 0;
   private tickTimer: NodeJS.Timeout | null = null;
   private running = false;
 
@@ -58,6 +66,7 @@ export class Scheduler {
     this.isAutoRunEnabled = opts.isAutoRunEnabled;
     this.getQuotaSnapshot = opts.getQuotaSnapshot;
     this.refreshQuotaSnapshot = opts.refreshQuotaSnapshot;
+    this.discoveryCfg = { ...DEFAULT_DISCOVERY, ...(opts.discovery ?? {}) };
   }
 
   /** 启动周期性 tick（默认每 30 秒） */
@@ -156,6 +165,39 @@ export class Scheduler {
     return promoted;
   }
 
+  /**
+   * 会话自动发现（节流版）。
+   *
+   * CAR 原本只会跑「队列里已有的任务」—— 桌面版哪条会话撞了 5h 限额它一无所知，
+   * 用户必须醒着手动建任务。这一步把那些线程自己捡进来，
+   * 是「撞限额后不用醒来」的最后一块拼图。
+   *
+   * 节流到 discoveryCfg.intervalMs（默认 60s）：tick 自身可能只有 10~30s，
+   * 没必要每轮都跑一遍 thread/list + thread/read。
+   */
+  private async maybeDiscover(): Promise<void> {
+    if (!this.discoveryCfg.enabled) return;
+    const now = Date.now();
+    if (now - this.lastDiscoveryAt < this.discoveryCfg.intervalMs) return;
+    this.lastDiscoveryAt = now;
+    try {
+      const outcome = await runDiscovery(
+        { client: this.client, repo: this.repo, logger: this.log, config: this.discoveryCfg },
+        now,
+      );
+      if (outcome.created.length) {
+        this.log.info("auto-discovery created tasks", {
+          created: outcome.created.length,
+          scanned: outcome.scanned,
+          candidates: outcome.candidates.length,
+        });
+      }
+    } catch (e) {
+      // 发现失败不应拖垮调度循环：下一轮再试即可。
+      this.log.warn("auto-discovery failed", { err: String(e) });
+    }
+  }
+
   private scheduleTick(delay: number): void {
     setTimeout(() => void this.tick().catch((e) => this.log.error("scheduled tick error", { err: String(e) })), delay);
   }
@@ -189,6 +231,10 @@ export class Scheduler {
         }
         // available / near_limit -> 继续
       }
+
+      // 会话自动发现：把「被额度打断、但 CAR 还不知道」的桌面版会话接进队列。
+      // 放在 promote 之前，本轮新发现的任务同一 tick 就能参与 claim。
+      await this.maybeDiscover();
 
       // 自动提升：到期的 FAILED_RETRYABLE -> READY。
       // claimNextRunnable 只认 READY，缺这一步则「撞锁 / 瞬时失败」的任务永不重试。
