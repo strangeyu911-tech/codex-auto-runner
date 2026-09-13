@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Auto Runner — 使用指南</title>
+<style>
+  :root{
+    --bg:#ffffff; --bg2:#f7f7f5; --bg3:#f1efe8;
+    --tx:#1f1f1e; --tx2:#5f5e5a; --tx3:#888780;
+    --bd:#e3e1d9; --bd2:#cfcdc4;
+    --blue:#185FA5; --blue-bg:#E6F1FB;
+    --green:#3B6D11; --green-bg:#EAF3DE;
+    --amber:#854F0B; --amber-bg:#FAEEDA;
+    --red:#A32D2D; --red-bg:#FCEBEB;
+    --purple:#534AB7; --purple-bg:#EEEDFE;
+    --teal:#0F6E56; --teal-bg:#E1F5EE;
+    --mono:"Cascadia Code","Consolas","Menlo",monospace;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; padding:0;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:15px; line-height:1.75; color:var(--tx); background:var(--bg2);
+  }
+  .wrap{max-width:920px; margin:0 auto; padding:0 24px 96px}
+
+  header{
+    background:var(--bg); border-bottom:1px solid var(--bd);
+    padding:44px 0 36px; margin-bottom:36px;
+  }
+  header .wrap{padding-bottom:0}
+  .kicker{
+    display:inline-block; font-size:12px; letter-spacing:.08em;
+    color:var(--blue); background:var(--blue-bg);
+    border:1px solid #B5D4F4; border-radius:999px;
+    padding:3px 12px; margin-bottom:14px;
+  }
+  h1{font-size:30px; line-height:1.3; margin:0 0 12px; font-weight:600; letter-spacing:-.01em}
+  .sub{font-size:16px; color:var(--tx2); margin:0; max-width:660px}
+  .meta{margin-top:20px; font-size:13px; color:var(--tx3)}
+  .meta code{font-size:12.5px}
+
+  h2{
+    font-size:21px; font-weight:600; margin:52px 0 16px;
+    padding-bottom:10px; border-bottom:2px solid var(--bd2);
+    letter-spacing:-.01em;
+  }
+  h3{font-size:16px; font-weight:600; margin:30px 0 10px}
+  p{margin:12px 0}
+  ul,ol{margin:12px 0; padding-left:24px}
+  li{margin:6px 0}
+  li>ul,li>ol{margin:6px 0}
+  strong{font-weight:600}
+  a{color:var(--blue); text-decoration:none; border-bottom:1px solid #B5D4F4}
+  a:hover{border-bottom-color:var(--blue)}
+
+  code{
+    font-family:var(--mono); font-size:13px;
+    background:var(--bg3); border:1px solid var(--bd);
+    border-radius:4px; padding:1px 6px; color:#26215C;
+  }
+  pre{
+    background:#1f1f1e; color:#e8e6e0;
+    border-radius:10px; padding:16px 18px; margin:14px 0;
+    overflow-x:auto; font-size:13px; line-height:1.7;
+  }
+  pre code{background:none; border:none; padding:0; color:inherit; font-size:13px}
+  pre .c{color:#9a9790}
+  pre .k{color:#7F77DD}
+  pre .s{color:#97C459}
+  pre .o{color:#EF9F27}
+
+  .card{
+    background:var(--bg); border:1px solid var(--bd);
+    border-radius:12px; padding:22px 24px; margin:20px 0;
+  }
+  .card h3{margin-top:0}
+  .card>:last-child{margin-bottom:0}
+
+  .callout{
+    border-radius:10px; padding:14px 18px; margin:18px 0;
+    border-left:3px solid; font-size:14px;
+  }
+  .callout p{margin:6px 0}
+  .callout>:first-child{margin-top:0}
+  .callout>:last-child{margin-bottom:0}
+  .c-info{background:var(--blue-bg); border-color:var(--blue); color:#042C53}
+  .c-warn{background:var(--amber-bg); border-color:var(--amber); color:#412402}
+  .c-ok{background:var(--green-bg); border-color:var(--green); color:#173404}
+  .c-danger{background:var(--red-bg); border-color:var(--red); color:#501313}
+  .callout code{background:rgba(0,0,0,.06); border-color:rgba(0,0,0,.12); color:inherit}
+
+  table{
+    width:100%; border-collapse:collapse; margin:16px 0;
+    font-size:14px; background:var(--bg);
+    border:1px solid var(--bd); border-radius:8px; overflow:hidden;
+  }
+  th,td{padding:10px 14px; text-align:left; border-bottom:1px solid var(--bd); vertical-align:top}
+  th{background:var(--bg3); font-weight:600; font-size:13px; color:var(--tx2)}
+  tr:last-child td{border-bottom:none}
+  td code{font-size:12.5px}
+
+  .steps{counter-reset:s; list-style:none; padding:0; margin:20px 0}
+  .steps>li{
+    counter-increment:s; position:relative;
+    padding:0 0 4px 46px; margin:0 0 22px;
+  }
+  .steps>li::before{
+    content:counter(s);
+    position:absolute; left:0; top:1px;
+    width:28px; height:28px; border-radius:50%;
+    background:var(--blue); color:#fff;
+    font-size:14px; font-weight:600;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .steps>li::after{
+    content:""; position:absolute; left:13.5px; top:34px; bottom:-18px;
+    width:1px; background:var(--bd2);
+  }
+  .steps>li:last-child::after{display:none}
+  .steps>li>strong{display:block; font-size:15px; margin-bottom:4px}
+
+  .toc{
+    background:var(--bg); border:1px solid var(--bd);
+    border-radius:12px; padding:20px 24px; margin:0 0 36px;
+  }
+  .toc h3{margin:0 0 10px; font-size:14px; color:var(--tx2); letter-spacing:.02em}
+  .toc ol{margin:0; padding-left:20px; columns:2; column-gap:32px}
+  .toc li{margin:5px 0; font-size:14px; break-inside:avoid}
+  @media(max-width:640px){.toc ol{columns:1}}
+
+  .badge{
+    display:inline-block; font-size:11.5px; font-weight:600;
+    border-radius:5px; padding:2px 8px; border:1px solid;
+    vertical-align:middle; white-space:nowrap;
+  }
+  .b-new{background:var(--green-bg); border-color:#97C459; color:#173404}
+  .b-lim{background:var(--amber-bg); border-color:#EF9F27; color:#412402}
+
+  .filetree{
+    font-family:var(--mono); font-size:13px; line-height:1.85;
+    background:var(--bg); border:1px solid var(--bd);
+    border-radius:10px; padding:16px 20px; overflow-x:auto;
+  }
+  .filetree .d{color:var(--blue)}
+  .filetree .n{color:var(--tx3); font-size:12px}
+
+  footer{
+    margin-top:64px; padding-top:22px; border-top:1px solid var(--bd);
+    font-size:13px; color:var(--tx3);
+  }
+  hr{border:none; border-top:1px solid var(--bd); margin:36px 0}
+
+  @media print{
+    body{background:#fff; font-size:11.5pt}
+    header{background:#fff; padding:0 0 18px}
+    .toc{display:none}
+    h2{page-break-after:avoid}
+    pre,.card,.callout,table{page-break-inside:avoid}
+    .wrap{max-width:none; padding:0}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <span class="kicker">使用指南</span>
+    <h1>Codex Auto Runner</h1>
+    <p class="sub">
+      让 Codex 的 5h 额度恢复窗口自动接上没跑完的任务——不新开空会话、不丢上下文、不让恢复后的窗口沉默过去。
+    </p>
+    <p class="meta">
+      适用于本机 <code>codex-auto-runner</code> 部署 &nbsp;·&nbsp; Windows + Codex Desktop &nbsp;·&nbsp; Node.js 20+
+    </p>
+  </div>
+</header>
+
+<div class="wrap">
+
+<div class="toc">
+  <h3>目录</h3>
+  <ol>
+    <li><a href="#what">这是什么</a></li>
+    <li><a href="#quick">快速开始</a></li>
+    <li><a href="#flow">核心工作流</a></li>
+    <li><a href="#new">无 goal 续跑（新增）</a></li>
+    <li><a href="#verify">如何确认它真在跑</a></li>
+    <li><a href="#state">任务状态含义</a></li>
+    <li><a href="#cli">命令速查</a></li>
+    <li><a href="#env">环境变量</a></li>
+    <li><a href="#files">数据与文件位置</a></li>
+    <li><a href="#faq">常见问题</a></li>
+    <li><a href="#safety">安全边界</a></li>
+    <li><a href="#limits">已知限制</a></li>
+  </ol>
+</div>
+
+<h2 id="what">1. 这是什么</h2>
+
+<p>
+  长任务跑到一半，5h 额度耗尽。上下文还在、目标还在、任务没结束，但下一次额度恢复时人不一定守在电脑前。
+  Codex Auto Runner 就是为这一刻准备的：它在本机盯着真实额度，等窗口恢复、二次确认额度确实可用，
+  然后<strong>恢复同一个 Codex 线程</strong>，把任务接着往下推。
+</p>
+
+<p>
+  它要解决的不是「如何绕过限制」，而是「<strong>如何不浪费已经恢复的额度</strong>」。
+  它是一个非官方本地工具，不突破、不规避、不修改任何额度规则。
+</p>
+
+<div class="callout c-info">
+  <p><strong>它是本机工具：</strong>daemon 只监听 <code>127.0.0.1</code>，HTTP API 需要本地随机 token 鉴权，
+  不自动 push、不自动部署、不替你接受高风险审批。</p>
+</div>
+
+<h2 id="quick">2. 快速开始</h2>
+
+<div class="callout c-warn">
+  <p><strong>本机没有安装 pnpm</strong>（<code>pnpm</code> 不在 PATH 上）。
+  仓库 README 里写的 <code>pnpm xxx</code> 命令在本机跑不通，请用下面这些 <strong>node 直调</strong>命令。
+  pnpm 只是包管理/任务编排的便利层，核心逻辑全部由 node 驱动，跳过它不影响功能。</p>
+</div>
+
+<h3>2.1 启动 daemon（守护进程）</h3>
+
+<p>双击仓库根目录的 <code>start-daemon.cmd</code>，或手动执行：</p>
+
+<pre><code><span class="c">:: 在仓库根目录执行</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\daemon\src\index.ts</code></pre>
+
+<p>看到 <code>http api listening</code> 与 <code>http api ready</code> 即为启动成功。daemon 会：</p>
+<ul>
+  <li>连接 Codex app-server，读取真实额度桶（5h + 周）</li>
+  <li>按真实 reset 时间安排唤醒，并在唤醒点做抖动后的二次验证</li>
+  <li>调度任务队列、提供本地 HTTP API、把状态写入 SQLite</li>
+</ul>
+
+<h3>2.2 启动前端（另开一个窗口）</h3>
+
+<pre><code><span class="k">cd</span> apps\web
+<span class="k">node</span> node_modules\vite\bin\vite.js</code></pre>
+
+<p>然后浏览器打开 <code>http://127.0.0.1:5173/</code>。</p>
+
+<div class="callout c-danger">
+  <p><strong>顺序很重要：先启动 daemon，再启动前端。</strong>
+  前端在启动时读取 daemon 写下的 <code>api.json</code> 来拿端口和 token；
+  如果先起前端，它拿不到 token，界面会请求失败（401）。</p>
+</div>
+
+<h3>2.3 目录与端口说明</h3>
+
+<table>
+  <tr><th>项目</th><th>值</th></tr>
+  <tr><td>前端开发地址</td><td><code>http://127.0.0.1:5173/</code>（Vite，自动代理 <code>/api</code> 并注入 token）</td></tr>
+  <tr><td>daemon HTTP API</td><td>随机端口，每次启动不同，记录在 <code>api.json</code></td></tr>
+  <tr><td>数据目录</td><td><code>%LOCALAPPDATA%\CodexAutoRunner\data</code></td></tr>
+  <tr><td>Codex 可执行文件</td><td>首次运行时自动从 MSIX 复制到 <code>%LOCALAPPDATA%\CodexAutoRunner\codex-portable\</code></td></tr>
+</table>
+
+<p>想知道当前 daemon 用的是哪个端口：</p>
+<pre><code><span class="k">type</span> "%LOCALAPPDATA%\CodexAutoRunner\data\api.json"</code></pre>
+
+<h2 id="flow">3. 核心工作流</h2>
+
+<ol class="steps">
+  <li>
+    <strong>在 Codex 里把任务跑起来</strong>
+    在一个 Codex 会话里正常干活，跑到 5h 额度耗尽为止。不需要提前做任何特殊设置。
+  </li>
+  <li>
+    <strong>在 Web UI 里选中那个会话</strong>
+    打开「新建任务」，选择要接管的 Codex 会话。
+    列表里会标注每个会话是否「当前加载」、是否设置过目标，以及<strong>是否上次因 5h 限额中断</strong>。
+  </li>
+  <li>
+    <strong>创建续跑任务</strong>
+    切换到「自动版」，确认目标与「继续指令」后创建任务。
+    任务会以 <code>resume_thread</code> 模式绑定这个线程——不新建空会话，沿用原上下文。
+  </li>
+  <li>
+    <strong>放手，让它自己接棒</strong>
+    额度耗尽 → 任务进入 <code>WAITING_QUOTA</code> → 到点后二次确认额度 → 恢复同一线程 → 继续推进。
+    循环直到任务完成、需要你判断，或周额度被充分消耗。
+  </li>
+</ol>
+
+<h2 id="new">4. 无 goal 续跑（新增）</h2>
+
+<p>
+  <span class="badge b-new">重要变化</span>
+  早期版本的自动版<strong>只支持已开启「目标模式」的会话</strong>，没有设置 goal 的会话会被前端拦住。
+  现在这条限制已经解除：<strong>没有设置 goal 的线程同样可以被接管并跨额度窗口续跑</strong>。
+</p>
+
+<p>这依赖三件事：</p>
+
+<table>
+  <tr><th>能力</th><th>说明</th></tr>
+  <tr>
+    <td>识别「谁被限额打断」</td>
+    <td>命中限额时把<strong>线程 id + 时间</strong>落库。关键点：不依赖 goal——因为无 goal 线程读目标是 <code>null</code>，据此判断必然漏判。</td>
+  </tr>
+  <tr>
+    <td>优先续跑最新的那条</td>
+    <td>同时有多条被 5h 限制中断的线程时，<strong>优先续跑最新被打断的那条</strong>；会话列表与调度认领都按这个顺序。</td>
+  </tr>
+  <tr>
+    <td>重启后保住语义</td>
+    <td>daemon 重启时，被限额打断的任务会回到 <code>WAITING_QUOTA</code>（等额度自动接着跑），而不是一律降级成 <code>WAITING_USER</code> 要求你手动确认。</td>
+  </tr>
+</table>
+
+<div class="callout c-ok">
+  <p><strong>你显式设置的优先级依然优先。</strong>
+  「被打断优先」只在优先级相同的前提下生效，不会掀翻你自己设定的高优先级任务。</p>
+</div>
+
+<h3>界面上的表现</h3>
+<ul>
+  <li>会话列表里被限额打断过的线程会带一个 <strong>「上次因 5h 限额中断」</strong> 角标，并显示中断时间。</li>
+  <li>默认选中项会优先落在<strong>最近被打断的那个线程</strong>，不用你自己往下翻找。</li>
+  <li>无 goal 会话的说明文字为「未开启目标模式（可直接按会话上下文续跑）」。</li>
+</ul>
+
+<h2 id="verify">5. 如何确认它真在跑</h2>
+
+<div class="callout c-warn">
+  <p><strong>不要用 Codex 桌面版 GUI 判断任务有没有在跑。</strong>
+  daemon 用的是从 MSIX 单独复制的 <code>codex.exe</code>，和桌面 GUI 是<strong>两个进程</strong>，
+  只共享 <code>~/.codex</code> 数据目录。GUI 不会实时刷新别的进程写入的回合，
+  所以你很可能在界面里「看不到任何动静」，但任务其实跑得好好的。</p>
+</div>
+
+<p>按下面三条链路核实（从轻到重）：</p>
+
+<h3>① 看任务状态</h3>
+<p>Web UI 的任务列表，或命令行：</p>
+<pre><code><span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts status</code></pre>
+
+<h3>② 看事件流</h3>
+<p><code>events.jsonl</code> 会追加关键事件，这是最直接的「它动过」的证据：</p>
+<pre><code><span class="k">type</span> "%LOCALAPPDATA%\CodexAutoRunner\data\events.jsonl"</code></pre>
+<p>关注这几类：<code>quota/interrupted</code>（被限额打断）、<code>quota/recovered</code>（额度恢复）、
+<code>thread.resumed</code>（线程已恢复）、<code>turn/started</code>、<code>turn/completed</code>。</p>
+
+<h3>③ 看 Codex 会话文件是否被写入</h3>
+<p>这是最终事实来源。检查会话 rollout 文件的修改时间：</p>
+<p>Codex 的数据目录默认为 <code>%USERPROFILE%\.codex</code>（即 <code>CODEX_HOME</code>），
+会话记录放在它下面的 <code>sessions</code> 子目录里：</p>
+<pre><code><span class="c">:: 列出最近被写入的会话文件（按时间倒序）</span>
+<span class="k">dir</span> /s /o-d "&lt;CODEX_HOME&gt;\sessions\*.jsonl"</code></pre>
+<p>如果 <code>rollout-*.jsonl</code> 的修改时间就在刚才，说明 Codex 确实在产出内容，
+只是 GUI 还没刷出来。切换会话或重启桌面版即可看到新回复。</p>
+
+<h2 id="state">6. 任务状态含义</h2>
+
+<table>
+  <tr><th>状态</th><th>含义</th></tr>
+  <tr><td><code>READY</code></td><td>已就绪，等待调度器认领</td></tr>
+  <tr><td><code>RUNNING</code></td><td>正在执行一个回合（turn）</td></tr>
+  <tr><td><code>WAITING_QUOTA</code></td><td>被 5h/周额度打断，等额度恢复后自动继续</td></tr>
+  <tr><td><code>WAITING_AUTH</code></td><td>需要登录，暂停自动推进</td></tr>
+  <tr><td><code>WAITING_USER</code></td><td>需要你判断（验证失败、无进展、非额度异常中断等）</td></tr>
+  <tr><td><code>VERIFYING</code></td><td>回合结束，正在跑验证命令</td></tr>
+  <tr><td><code>NEEDS_CONTINUE</code></td><td>任务未完成但仍有进展，稍后自动继续</td></tr>
+  <tr><td><code>PAUSED</code></td><td>已暂停，不再被自动调度</td></tr>
+  <tr><td><code>COMPLETED</code></td><td>完成（验收标准全部通过）</td></tr>
+  <tr><td><code>FAILED_RETRYABLE</code></td><td>失败但可重试，稍后重投</td></tr>
+  <tr><td><code>RECOVERING</code></td><td>daemon 重启时发现的「异常运行中」任务，等待归类</td></tr>
+</table>
+
+<h2 id="cli">7. 命令速查</h2>
+
+<p>本机无 pnpm，统一用 <code>node + tsx</code> 直调 CLI：</p>
+
+<pre><code><span class="c">:: 简写：在仓库根目录把下面这行设为 CAR</span>
+<span class="c">:: node node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts</span>
+
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts status          <span class="c"># 额度 + 任务概览</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts quota           <span class="c"># 仅额度详情</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task list       <span class="c"># 任务列表</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task show &lt;id&gt;   <span class="c"># 任务详情</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task run-now &lt;id&gt; <span class="c"># 立即运行</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task pause &lt;id&gt;  <span class="c"># 暂停</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task resume &lt;id&gt; <span class="c"># 恢复</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task cancel &lt;id&gt; <span class="c"># 取消</span></code></pre>
+
+<p><code>pause / resume / run-now</code> 直接写数据库；daemon 的调度器在下一个 tick 读取。
+daemon 没在跑时状态照样写入，启动后会被处理。</p>
+
+<h3>开发与检查</h3>
+<pre><code><span class="c">:: 构建前端</span>
+<span class="k">cd</span> apps\web &amp;&amp; <span class="k">node</span> node_modules\vite\bin\vite.js build
+
+<span class="c">:: 类型检查（逐个包）</span>
+<span class="k">node</span> node_modules\typescript\bin\tsc -p apps\daemon\tsconfig.json --noEmit
+
+<span class="c">:: 单元测试</span>
+<span class="k">node</span> node_modules\vitest\vitest.mjs run
+<span class="k">node</span> --test packages\persistence\test\repository.test.ts
+<span class="k">node</span> --test test\quota-resume-e2e.test.ts    <span class="c"># 5h 限额续跑端到端验收</span>
+
+<span class="c">:: 隐私检查（提交前必跑）</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs scripts\privacy-check.ts</code></pre>
+
+<h2 id="env">8. 环境变量</h2>
+
+<table>
+  <tr><th>变量</th><th>默认</th><th>作用</th></tr>
+  <tr>
+    <td><code>CAR_ALLOW_DIRTY</code></td><td>未设置</td>
+    <td>设为 <code>1</code> 允许在<strong>有未提交改动的工作区</strong>里跑任务。
+    只放行，不会 stash / reset / checkout，你的改动零风险。</td>
+  </tr>
+  <tr><td><code>CAR_LOG_LEVEL</code></td><td><code>info</code></td><td>日志级别：<code>debug</code> / <code>info</code> / <code>warn</code> / <code>error</code></td></tr>
+  <tr><td><code>CAR_DATA_DIR</code></td><td><code>%LOCALAPPDATA%\CodexAutoRunner\data</code></td><td>自定义数据目录</td></tr>
+  <tr><td><code>CAR_API_PORT</code></td><td><code>0</code>（随机）</td><td>固定 HTTP API 端口，便于反复访问</td></tr>
+  <tr><td><code>CAR_DAEMON_TICK_MS</code></td><td><code>30000</code></td><td>调度器 tick 间隔（毫秒）</td></tr>
+  <tr><td><code>CAR_CODEX_EXEC</code></td><td>自动发现</td><td>显式指定 codex 可执行文件路径</td></tr>
+</table>
+
+<h2 id="files">9. 数据与文件位置</h2>
+
+<div class="filetree">
+<span class="d">%LOCALAPPDATA%\CodexAutoRunner\</span>
+├── <span class="d">data\</span>
+│   ├── runner.db          <span class="n"># SQLite：任务、事件、锁、额度快照</span>
+│   ├── api.json           <span class="n"># daemon 端口 + token 文件位置</span>
+│   ├── car-api.token      <span class="n"># 本地 API token</span>
+│   ├── status.json        <span class="n"># 最近一次额度快照</span>
+│   ├── events.jsonl       <span class="n"># 关键事件流（额度恢复等）</span>
+│   ├── settings.json      <span class="n"># 自动运行开关</span>
+│   ├── daemon.lock        <span class="n"># 单实例锁</span>
+│   └── tasks\             <span class="n"># 每个任务的 checkpoint</span>
+└── <span class="d">codex-portable\</span>
+    └── codex.exe          <span class="n"># 从 MSIX 复制的独立副本</span>
+</div>
+
+<p>Codex 侧的数据（会话历史）仍在原本的位置：<code>%USERPROFILE%\.codex\</code>。
+daemon 与桌面版共享它，所以续跑的产出对 GUI 是可见的——只是需要手动刷新。</p>
+
+<h2 id="faq">10. 常见问题</h2>
+
+<h3>打开前端一片空白 / 提示未授权</h3>
+<p>两个原因，按顺序排查：</p>
+<ol>
+  <li><strong>启动顺序反了。</strong>必须先起 daemon，再起前端——前端启动时要从 <code>api.json</code> 读 token。</li>
+  <li><strong>daemon 没在跑。</strong>确认已有 <code>http api ready</code> 日志。</li>
+</ol>
+<p>如果页面弹出「请粘贴 car-api.token 内容」，把 <code>%LOCALAPPDATA%\CodexAutoRunner\data\car-api.token</code> 的内容粘进去即可。</p>
+
+<h3>任务一直不动，也不报错</h3>
+<p>多半是<strong>额度状态是 <code>unknown</code></strong>。这通常意味着读取额度桶的网络请求失败了，
+调度器在额度未知时会保守地不启动任务（这是设计行为，不是 bug）。
+检查 <code>status.json</code> 里的 <code>status</code> 字段，网络恢复后会自动继续。</p>
+
+<h3>提示 dirty worktree，任务不跑</h3>
+<p>工作区有未提交改动。确认不需要提交后，设置 <code>CAR_ALLOW_DIRTY=1</code> 再启动 daemon
+（<code>start-daemon.cmd</code> 里已经默认设置）。它<strong>不会</strong> stash 或 reset 你的任何改动。</p>
+
+<h3>Codex 桌面版里看不到续跑的内容</h3>
+<p>正常现象，见第 5 节。daemon 与 GUI 是两个进程，GUI 不实时刷新别的进程写入的回合。
+以 <code>events.jsonl</code> 和 sessions 目录下 <code>rollout-*.jsonl</code> 的修改时间为准。</p>
+
+<h3>同时有好几个会话都被限额打断，会跑哪个？</h3>
+<p>优先跑<strong>最新被打断的那条</strong>。其余保持等待，当前任务跑完后再按同样顺序认领。
+如果你想让某个任务先跑，把它的优先级调高即可——显式优先级高于「被打断」加成。</p>
+
+<h3>额度显示 100% 了，是不是完全不能跑了？</h3>
+<p>不一定。5h 桶打满时 Codex 可能<strong>降级回退到备用模型</strong>继续工作。
+另外若开启了「周额度重置次数续跑」，周额度耗尽时也可消耗重置次数继续。</p>
+
+<h2 id="safety">11. 安全边界</h2>
+
+<ul>
+  <li>daemon 只监听 <code>127.0.0.1</code>，不对外暴露。</li>
+  <li>本地 HTTP API 需要随机 token 鉴权；token 只存在本机数据目录。</li>
+  <li>不自动 push、不自动部署、不替你接受高风险审批。</li>
+  <li>不修改 Git 历史（不发 <code>reset --hard</code> / <code>push --force</code> / <code>clean -fd</code>）。</li>
+  <li>Codex 网络访问默认关闭，需要显式开启。</li>
+  <li>日志会脱敏 token、authorization、secret、账号标识等字段；本机路径前缀也会被脱敏。</li>
+  <li>额度未知、需要登录、项目被锁定、验证失败或需要人工判断时，调度器会停止自动推进。</li>
+  <li><code>.env</code>、日志、数据库、构建产物、探针转储等均被 <code>.gitignore</code> 排除，不会进仓库。</li>
+</ul>
+
+<p>提交前跑一次隐私检查：</p>
+<pre><code><span class="k">node</span> node_modules\tsx\dist\cli.mjs scripts\privacy-check.ts</code></pre>
+<p>它会扫描仓库文件，发现真实用户路径、Codex 私有会话路径、常见 API Key、GitHub token 等时直接失败。</p>
+
+<h2 id="limits">12. 已知限制</h2>
+
+<table>
+  <tr><th>限制</th><th>说明与对策</th></tr>
+  <tr>
+    <td>仅 Windows + Codex Desktop</td>
+    <td>Codex 的发现逻辑依赖 Windows MSIX 包查询。其他平台暂未验证。</td>
+  </tr>
+  <tr>
+    <td><span class="badge b-lim">本机</span> 未安装 pnpm</td>
+    <td>README 中的 <code>pnpm xxx</code> 命令在本机不可用，请按本指南用 <code>node</code> 直调。</td>
+  </tr>
+  <tr>
+    <td>daemon 直接伺服前端（生产模式）暂不可用</td>
+    <td>
+      两个原因：① 静态资源也落在 token 鉴权之后，浏览器直接访问会返回 401；
+      ② 前端目录只在 daemon 启动时解析一次，启动后才 <code>build</code> 需要重启 daemon 才生效。
+      日常开发直接用 Vite 模式（<code>127.0.0.1:5173</code>）即可，这是当前推荐路径。
+    </td>
+  </tr>
+  <tr>
+    <td>daemon 无法由 agent 常驻拉起</td>
+    <td>需要长期后台运行请双击 <code>start-daemon.cmd</code>，或用启动文件夹（登录时生效）。</td>
+  </tr>
+</table>
+
+<footer>
+  <p>
+    Codex Auto Runner 是非官方的本地工具，不属于 OpenAI 官方产品。
+    本文档基于本机实测行为编写，命令均已验证可执行。
+  </p>
+</footer>
+
+</div>
+</body>
+</html>
