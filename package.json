@@ -28,8 +28,9 @@
     "schema:gen": "tsx scripts/generate-schema.ts",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "test": "vitest run && pnpm --filter @car/persistence test && pnpm --filter @car/task-engine test && node --test test/quota-resume-e2e.test.ts",
-    "test:quota": "node --test test/quota-resume-e2e.test.ts"
+    "test": "vitest run && pnpm --filter @car/persistence test && pnpm --filter @car/task-engine test && node --test test/quota-resume-e2e.test.ts && tsx --test apps/daemon/test/http-static.test.ts",
+    "test:quota": "node --test test/quota-resume-e2e.test.ts",
+    "test:http": "tsx --test apps/daemon/test/http-static.test.ts"
   },
   "devDependencies": {
     "tsx": "^4.19.0",

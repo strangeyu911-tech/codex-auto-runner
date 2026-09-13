@@ -144,11 +144,17 @@ async function main(): Promise<void> {
   void scheduler.tick().catch((e) => log.error("startup tick error", { err: String(e) }));
 
   // HTTP API（供前端调用）。端口默认 0=自动；可用 CAR_API_PORT 固定
-  const webDir = resolveWebDir();
+  // webDir 惰性解析：`apps/web/dist` 常在 daemon 启动后才 build 出来，
+  // 启动时解析一次会让之后 build 也不生效。命中后缓存，避免每次请求都 stat。
+  let webDirCache: string | undefined;
+  const getWebDir = (): string | undefined => {
+    if (!webDirCache) webDirCache = resolveWebDir();
+    return webDirCache;
+  };
   const httpPort = Number(process.env.CAR_API_PORT ?? 0);
-  const http = await startHttpApi({ repo, client, dataDir, logger: log, getQuotaSnapshot: () => latestQuota, getAutoRun: () => autoRun, setAutoRun, webDir }, httpPort);
+  const http = await startHttpApi({ repo, client, dataDir, logger: log, getQuotaSnapshot: () => latestQuota, getAutoRun: () => autoRun, setAutoRun, getWebDir }, httpPort);
   writeFileSync(join(dataDir, "api.json"), JSON.stringify({ baseUrl: http.baseUrl, port: http.port, tokenFile: "car-api.token" }, null, 2));
-  log.info("http api ready", { baseUrl: http.baseUrl, webDir: webDir ?? "(none, dev mode)" });
+  log.info("http api ready", { baseUrl: http.baseUrl, webDir: getWebDir() ?? "(none yet, dev mode or dist not built)" });
 
   // 优雅退出
   const shutdown = async (sig: string) => {
