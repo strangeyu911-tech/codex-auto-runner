@@ -212,8 +212,9 @@
 </p>
 
 <div class="callout c-info">
-  <p><strong>它是本机工具：</strong>daemon 只监听 <code>127.0.0.1</code>，HTTP API 需要本地随机 token 鉴权，
-  不自动 push、不自动部署、不替你接受高风险审批。</p>
+  <p><strong>它是本机工具：</strong>daemon 只监听 <code>127.0.0.1</code>，HTTP API 的
+  <code>/api/*</code> 需要本地随机 token 鉴权（静态前端页面本身免 token，否则浏览器打不开）。
+  它不自动 push、不自动部署、不替你接受高风险审批。</p>
 </div>
 
 <h2 id="quick">2. 快速开始</h2>
@@ -256,6 +257,7 @@
 <table>
   <tr><th>项目</th><th>值</th></tr>
   <tr><td>前端开发地址</td><td><code>http://127.0.0.1:5173/</code>（Vite，自动代理 <code>/api</code> 并注入 token）</td></tr>
+  <tr><td>生产模式地址</td><td><code>http://127.0.0.1:&lt;daemon 端口&gt;/</code>（daemon 直接伺服 <code>apps/web/dist</code>，不需要 Vite）</td></tr>
   <tr><td>daemon HTTP API</td><td>随机端口，每次启动不同，记录在 <code>api.json</code></td></tr>
   <tr><td>数据目录</td><td><code>%LOCALAPPDATA%\CodexAutoRunner\data</code></td></tr>
   <tr><td>Codex 可执行文件</td><td>首次运行时自动从 MSIX 复制到 <code>%LOCALAPPDATA%\CodexAutoRunner\codex-portable\</code></td></tr>
@@ -263,6 +265,43 @@
 
 <p>想知道当前 daemon 用的是哪个端口：</p>
 <pre><code><span class="k">type</span> "%LOCALAPPDATA%\CodexAutoRunner\data\api.json"</code></pre>
+
+<h3>2.4 生产模式：只跑 daemon 一个进程</h3>
+
+<p>
+  不想常驻一个 Vite 进程的话，可以让 daemon 直接伺服前端构建产物——一个端口、一个进程。
+  前置条件是 <code>apps/web/dist</code> 已经构建过。
+</p>
+
+<pre><code><span class="c">:: 1) 构建前端（仅代码变更后需要重跑）</span>
+<span class="k">cd</span> apps\web
+<span class="k">node</span> node_modules\vite\bin\vite.js build
+
+<span class="c">:: 2) 回到仓库根目录，确认 daemon 在跑，取端口</span>
+<span class="k">type</span> "%LOCALAPPDATA%\CodexAutoRunner\data\api.json"
+
+<span class="c">:: 3) 取 token</span>
+<span class="k">type</span> "%LOCALAPPDATA%\CodexAutoRunner\data\car-api.token"</code></pre>
+
+<p>
+  然后打开 <code>http://127.0.0.1:&lt;端口&gt;/</code>。页面本身能正常加载，但首次调用 API 会弹出粘贴框，
+  把 <code>car-api.token</code> 的内容粘进去即可，之后由浏览器记住。
+  也可以一步到位地用
+  <code>http://127.0.0.1:&lt;端口&gt;/#token=&lt;token&gt;</code>，页面会读取 hash 里的 token 并自动清掉 hash。
+</p>
+
+<div class="callout c-warn">
+  <p><strong>为什么首页能直接打开，但还是要手动带一次 token？</strong>
+  静态资源免鉴权（浏览器加载页面时无法附加自定义请求头），但 <code>/api/*</code> 仍需 token。
+  页面本身不会替你注入 token——否则任何本机进程只要请求一次首页就能拿到凭证，token 就失去意义了。
+  把 token 放在 URL 的 <code>#</code> 片段里，片段不会发送给服务器，只留在你的浏览器中。</p>
+</div>
+
+<div class="callout c-ok">
+  <p><strong>build 与 daemon 的先后顺序无所谓。</strong>
+  前端目录是惰性解析的：daemon 启动之后才 build 出来的 <code>dist</code>，下一次请求就会被接管，
+  不需要重启 daemon。</p>
+</div>
 
 <h2 id="flow">3. 核心工作流</h2>
 
@@ -401,11 +440,15 @@ daemon 没在跑时状态照样写入，启动后会被处理。</p>
 
 <span class="c">:: 单元测试</span>
 <span class="k">node</span> node_modules\vitest\vitest.mjs run
-<span class="k">node</span> --test packages\persistence\test\repository.test.ts
-<span class="k">node</span> --test test\quota-resume-e2e.test.ts    <span class="c"># 5h 限额续跑端到端验收</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs --test packages\persistence\test\repository.test.ts
+<span class="k">node</span> --test test\quota-resume-e2e.test.ts        <span class="c"># 5h 限额续跑端到端验收</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs --test apps\daemon\test\http-static.test.ts  <span class="c"># 静态资源鉴权 / 惰性 webDir</span>
 
 <span class="c">:: 隐私检查（提交前必跑）</span>
 <span class="k">node</span> node_modules\tsx\dist\cli.mjs scripts\privacy-check.ts</code></pre>
+
+<p>以上四条逐条执行等同于 <code>package.json</code> 里的 <code>test</code> 脚本。
+该脚本内部调用 <code>pnpm --filter</code>，本机没有 pnpm，因此请直接按上面的命令跑。</p>
 
 <h2 id="env">8. 环境变量</h2>
 
@@ -446,12 +489,16 @@ daemon 与桌面版共享它，所以续跑的产出对 GUI 是可见的——�
 <h2 id="faq">10. 常见问题</h2>
 
 <h3>打开前端一片空白 / 提示未授权</h3>
-<p>两个原因，按顺序排查：</p>
-<ol>
-  <li><strong>启动顺序反了。</strong>必须先起 daemon，再起前端——前端启动时要从 <code>api.json</code> 读 token。</li>
-  <li><strong>daemon 没在跑。</strong>确认已有 <code>http api ready</code> 日志。</li>
-</ol>
-<p>如果页面弹出「请粘贴 car-api.token 内容」，把 <code>%LOCALAPPDATA%\CodexAutoRunner\data\car-api.token</code> 的内容粘进去即可。</p>
+<p>先分清是「页面根本没打开」还是「页面打开了但数据是空的」：</p>
+<ul>
+  <li><strong>连页面都打不开</strong>：daemon 没在跑，或者访问的端口不对。
+  确认有 <code>http api ready</code> 日志，并用 <code>api.json</code> 里的端口访问。</li>
+  <li><strong>页面出来了但提示未授权 / 数据空</strong>：缺 token。把
+  <code>%LOCALAPPDATA%\CodexAutoRunner\data\car-api.token</code> 的内容填进弹出的粘贴框，
+  或在 URL 上加 <code>#token=&lt;token&gt;</code>。</li>
+  <li><strong>Vite 开发模式（5173）报错</strong>：多半是启动顺序反了——必须先起 daemon 再起前端，
+  前端启动时要从 <code>api.json</code> 读端口和 token。</li>
+</ul>
 
 <h3>任务一直不动，也不报错</h3>
 <p>多半是<strong>额度状态是 <code>unknown</code></strong>。这通常意味着读取额度桶的网络请求失败了，
@@ -478,7 +525,10 @@ daemon 与桌面版共享它，所以续跑的产出对 GUI 是可见的——�
 
 <ul>
   <li>daemon 只监听 <code>127.0.0.1</code>，不对外暴露。</li>
-  <li>本地 HTTP API 需要随机 token 鉴权；token 只存在本机数据目录。</li>
+  <li>本地 HTTP API 的 <code>/api/*</code> 需要随机 token 鉴权；token 只存在本机数据目录。</li>
+  <li>静态前端资源（SPA 外壳）不做鉴权，因为浏览器加载页面时无法附加自定义请求头。
+  它只包含构建产物、不含任何机密；数据与所有写操作仍然走需要 token 的 <code>/api/*</code>。
+  静态目录另有越界校验，<code>/../../</code> 之类路径无法读到 <code>dist</code> 之外的文件。</li>
   <li>不自动 push、不自动部署、不替你接受高风险审批。</li>
   <li>不修改 Git 历史（不发 <code>reset --hard</code> / <code>push --force</code> / <code>clean -fd</code>）。</li>
   <li>Codex 网络访问默认关闭，需要显式开启。</li>
@@ -504,11 +554,12 @@ daemon 与桌面版共享它，所以续跑的产出对 GUI 是可见的——�
     <td>README 中的 <code>pnpm xxx</code> 命令在本机不可用，请按本指南用 <code>node</code> 直调。</td>
   </tr>
   <tr>
-    <td>daemon 直接伺服前端（生产模式）暂不可用</td>
+    <td>生产模式首次访问要提供一次 token</td>
     <td>
-      两个原因：① 静态资源也落在 token 鉴权之后，浏览器直接访问会返回 401；
-      ② 前端目录只在 daemon 启动时解析一次，启动后才 <code>build</code> 需要重启 daemon 才生效。
-      日常开发直接用 Vite 模式（<code>127.0.0.1:5173</code>）即可，这是当前推荐路径。
+      首页免 token 即可打开，但 <code>/api/*</code> 仍需凭证，所以第一次要在弹出的粘贴框里
+      填入 <code>data\car-api.token</code> 的内容，或直接用
+      <code>http://127.0.0.1:&lt;端口&gt;/#token=&lt;token&gt;</code> 引导一次。
+      token 由首启随机生成，文件 ACL 限本用户；页面上的「重置 token」链接可清除浏览器里记的那份。
     </td>
   </tr>
   <tr>
