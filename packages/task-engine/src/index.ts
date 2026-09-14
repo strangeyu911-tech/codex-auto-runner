@@ -587,6 +587,109 @@ export function probeQuotaInterrupted(
   return { interrupted, turnId: last.id ?? null, turnStatus, errorInfo };
 }
 
+/* ------------------------ 进程重启后的恢复判定 ------------------------ */
+
+/** 恢复扫描要给任务落的三个去处。 */
+export type RecoveryAction = "WAITING_QUOTA" | "WAITING_USER" | "READY";
+
+/** 「崩溃留下的 RUNNING，需要人确认」的专用标记文案（恢复扫描独有，人不会写）。 */
+export const RECOVERY_NEEDS_CONFIRM = "process restarted mid-run; needs user confirm";
+
+/** 「崩溃留下的 RUNNING，且确证卡在额度上」的文案。 */
+export const RECOVERY_QUOTA_DEFERRED =
+  "process restarted mid-run while quota-limited; will auto-resume on recovery";
+
+export interface RecoveryDecision {
+  action: RecoveryAction;
+  /** 要写进 lastError 的值；null = 清空 */
+  lastError: string | null;
+  /** 判定依据（写进事件，便于事后追溯「为什么它自己跑起来了」） */
+  why: string;
+  lastTurnStatus: string | null;
+}
+
+/**
+ * 判定「进程重启时还挂在 RUNNING 的任务」下一步该去哪。
+ *
+ * 过去这里一律保守判成 WAITING_USER —— 用户必须醒着手动点一次续跑，
+ * 这和「撞 5h 后我不用醒来」直接冲突。
+ *
+ * 这类任务的命运其实有两种，而且能靠**线程的 turn 历史**区分：
+ *
+ *   a) 最后一个 turn 是 `completed`：崩溃发生在「turn 跑完、状态还没落库」之间，
+ *      活儿可能已经干完了；agent 主动停下要人决策（needs_user）也落在这里。
+ *      → 保守，等人确认。
+ *   b) 最后一个 turn 是 `interrupted` / `failed` / `inProgress`：
+ *      这个 turn 没跑完，工作**明确**没做完 → 直接排队续跑，不需要人。
+ *
+ * ⚠️ 只拿 `interrupted` 回答「活干完了没有」，**绝不要**拿它反推「是不是额度打断」：
+ *    实测 8/8 的 interrupted turn 都是 `error=null`，这个状态不携带任何成因，
+ *    据此放宽额度判定会把用户主动停掉的线程也捡起来（正是 discovery 明令禁止的误捡）。
+ *
+ * 读不到线程历史时一律 fail closed（→ WAITING_USER）：宁可漏续，不可误续。
+ */
+export function decideRecovery(input: {
+  /** CAR 侧已确证的额度特征（task_runs.quota_exhausted 或 lastQuotaInterruptedAt） */
+  quotaHit: boolean;
+  /** 线程历史是否成功读到 */
+  threadReadable: boolean;
+  turns: Array<{ id?: string; status?: string }> | undefined;
+}): RecoveryDecision {
+  const turns = input.turns ?? [];
+  const last = turns.length ? turns[turns.length - 1] : undefined;
+  const lastTurnStatus = last?.status ?? null;
+
+  if (input.quotaHit) {
+    // 额度语义优先：等额度恢复时由 onQuotaRecovered() 推回 READY，
+    // 比直接排队更准（能用上 quotaResetAt）
+    return {
+      action: "WAITING_QUOTA",
+      lastError: RECOVERY_QUOTA_DEFERRED,
+      why: "quota fingerprint recorded on the task itself",
+      lastTurnStatus,
+    };
+  }
+  if (!input.threadReadable) {
+    return {
+      action: "WAITING_USER",
+      lastError: RECOVERY_NEEDS_CONFIRM,
+      why: "thread history unreadable; cannot tell whether the turn finished",
+      lastTurnStatus: null,
+    };
+  }
+  if (!last) {
+    return {
+      action: "WAITING_USER",
+      lastError: RECOVERY_NEEDS_CONFIRM,
+      why: "thread has no turns; nothing to resume",
+      lastTurnStatus: null,
+    };
+  }
+  if (lastTurnStatus === "completed") {
+    return {
+      action: "WAITING_USER",
+      lastError: RECOVERY_NEEDS_CONFIRM,
+      why: "last turn completed before the crash; the agent may be waiting for a human",
+      lastTurnStatus,
+    };
+  }
+  if (lastTurnStatus === "interrupted" || lastTurnStatus === "failed" || lastTurnStatus === "inProgress") {
+    return {
+      action: "READY",
+      lastError: null,
+      why: `last turn is ${lastTurnStatus}; the run was cut off before finishing`,
+      lastTurnStatus,
+    };
+  }
+  // 状态缺失 / 不认识的状态 —— 连「跑完没有」都判断不了，fail closed
+  return {
+    action: "WAITING_USER",
+    lastError: RECOVERY_NEEDS_CONFIRM,
+    why: `last turn status is ${lastTurnStatus ?? "unset"}; not a recognised terminal state, so fail closed`,
+    lastTurnStatus,
+  };
+}
+
 /** 从 turn/completed 的 items 中抽取结构化 CompletionResult */
 function extractCompletionResult(turn: unknown): CompletionResult | null {
   const t = turn as { items?: Array<{ type?: string; role?: string; content?: Array<{ type?: string; text?: string }> }> };

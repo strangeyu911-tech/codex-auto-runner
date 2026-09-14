@@ -3,7 +3,9 @@
  *
  * 闭环：
  *   单实例锁 → 解析 codex → 启动 app-server → 打开/迁移 DB
- *   → 恢复扫描（RECOVERING）→ QuotaWatcher 监测额度
+ *   → 恢复扫描（RECOVERING）→ 恢复判定：被进程死亡掐断的任务直接续跑，
+ *     只有「turn 其实已跑完」的才交给人确认
+ *   → QuotaWatcher 监测额度
  *   → Scheduler 周期 tick + 额度恢复后立即 tick
  *   → 会话自动发现：撞限额的桌面版会话自动建任务接管（可 CAR_DISCOVERY=0 关闭）
  *   → 额度可用且无 RUNNING 任务 → claim 最高优先级 → runOneTurn
@@ -26,6 +28,7 @@ import { SqliteRepository, defaultDataDir } from "@car/persistence";
 import { TaskEngine } from "@car/task-engine";
 import { InstanceLock } from "./instance-lock.js";
 import { QuotaWatcher } from "./quota-watch.js";
+import { recoverInterruptedTasks } from "./recovery.js";
 import { Scheduler } from "./scheduler.js";
 import { startHttpApi } from "./http-api.js";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -55,31 +58,11 @@ async function main(): Promise<void> {
   const repo = new SqliteRepository(join(dataDir, "runner.db"));
   repo.migrate();
 
-  // 恢复扫描：把异常运行中的任务改为 RECOVERING
+  // 恢复扫描：先无条件把「异常运行中」的任务收进 RECOVERING，避免调度器抢跑。
+  // 真正的去留判定要等 app-server 起来 —— 只有读到线程的 turn 历史，才能区分
+  // 「活儿已经干完」和「活儿被掐断」，见下方 recoverInterruptedTasks()。
   const abnormal = repo.scanAbnormalRunning();
   if (abnormal.length) log.warn("recovery: marked abnormal tasks RECOVERING", { count: abnormal.length });
-  for (const t of abnormal) {
-    // 第 6 项：保留「被额度打断」语义。
-    // 重启前如果这个任务正卡在 5h/周额度上（RUNNING 被 kill，或已经写了被打断标记），
-    // 一律降级成 WAITING_USER 会丢掉限额语义 —— 用户就不再能「丝滑续跑」，
-    // 必须手动确认。这里改为：命中限额特征 → WAITING_QUOTA；否则才 WAITING_USER。
-    const quotaHit = repo.lastRunQuotaExhausted(t.id) || t.lastQuotaInterruptedAt != null;
-    if (quotaHit) {
-      repo.forceStatus(t.id, "WAITING_QUOTA");
-      repo.patch(t.id, {
-        lastError: "process restarted mid-run while quota-limited; will auto-resume on recovery",
-      });
-      log.info("recovery: kept quota semantics", {
-        taskId: t.id,
-        threadId: t.lastQuotaInterruptedThreadId ?? t.threadId ?? null,
-        lastQuotaInterruptedAt: t.lastQuotaInterruptedAt,
-      });
-      continue;
-    }
-    // 保守：RECOVERING -> WAITING_USER，等用户确认是否续跑
-    repo.forceStatus(t.id, "WAITING_USER");
-    repo.patch(t.id, { lastError: "process restarted mid-run; needs user confirm" });
-  }
 
   // 自动运行开关（持久化在 settings.json）
   const settingsFile = join(dataDir, "settings.json");
@@ -100,6 +83,19 @@ async function main(): Promise<void> {
   const client = new AppServerClient({ codexPath: codex.path, logger: log, requestTimeoutMs: 60_000 });
   client.on("stderr", (line: string) => log.debug("app-server stderr", { line }));
   await client.start();
+
+  // 恢复判定：把「被进程死亡掐断」的任务直接放回队列，而不是一律等人确认。
+  // 额度语义（WAITING_QUOTA + 重置时间）优先于自动续跑，见 decideRecovery()。
+  const recovery = await recoverInterruptedTasks({ client, repo, logger: log }, abnormal);
+  if (recovery.examined) {
+    log.info("recovery complete", {
+      examined: recovery.examined,
+      resumed: recovery.resumed.length,
+      reclaimed: recovery.reclaimed.length,
+      parked: recovery.parked.length,
+      quotaDeferred: recovery.quotaDeferred.length,
+    });
+  }
 
   // 任务引擎
   const engine = new TaskEngine({ client, repo, logger: log, tasksDir: join(dataDir, "tasks") });
