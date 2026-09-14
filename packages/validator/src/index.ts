@@ -31,7 +31,15 @@ export interface CompletionResult {
   risk_notes: string[];
 }
 
-/** 让 Codex 严格遵守的 JSON Schema（用于 turn/start 的 outputSchema） */
+/**
+ * 结构化结论的字段契约。
+ *
+ * ⚠️ 这个形状**不再**通过 `turn/start` 的 `outputSchema` 传给 Codex。
+ * 原因：`outputSchema` 约束的是「最终那条 assistant 消息」，也就是用户在桌面版里
+ * 看到的那条 —— 用它就等于强制模型把一坨 JSON 打进对话。现在改成让模型把这个
+ * 形状写进项目里的 `.car/status.json`，回复本身保持正常说话。
+ * 字段形状保持不变，是为了兼容既有线程与历史事件里的 JSON。
+ */
 export const COMPLETION_SCHEMA = {
   type: "object",
   additionalProperties: false,

@@ -187,6 +187,7 @@
     <li><a href="#quick">快速开始</a></li>
     <li><a href="#flow">核心工作流</a></li>
     <li><a href="#new">无 goal 续跑（新增）</a></li>
+    <li><a href="#quiet-resume">续跑时对话长什么样</a></li>
     <li><a href="#verify">如何确认它真在跑</a></li>
     <li><a href="#state">任务状态含义</a></li>
     <li><a href="#cli">命令速查</a></li>
@@ -365,6 +366,47 @@
   <li>默认选中项会优先落在<strong>最近被打断的那个线程</strong>，不用你自己往下翻找。</li>
   <li>无 goal 会话的说明文字为「未开启目标模式（可直接按会话上下文续跑）」。</li>
 </ul>
+
+<h3 id="quiet-resume">续跑时对话长什么样（2026-09-14 改）</h3>
+
+<p>
+  早期版本为了拿结构化状态，会要求 Codex「严格按 <code>outputSchema</code> 返回 JSON」。
+  但 <code>turn/start</code> 的 <code>outputSchema</code> 约束的是<strong>最终那条 assistant 消息</strong>——
+  也就是你在桌面版里看到的那条。结果就是：每续跑一轮，对话里就多出一份整块的指令
+  ＋一坨原始 JSON。用户实测反馈是<strong>「太乱，不能算续跑成功」</strong>。
+</p>
+
+<p>现在改成：</p>
+
+<table>
+  <tr><th></th><th>改前</th><th>改后</th></tr>
+  <tr>
+    <td>每轮注入的指令</td>
+    <td>约 12 行固定套话，每轮原样重发</td>
+    <td>首轮发完整指令；<strong>第 2 轮起只有一句 <code>继续任务。</code></strong></td>
+  </tr>
+  <tr>
+    <td>模型的回复</td>
+    <td>被 <code>outputSchema</code> 逼成一坨 JSON</td>
+    <td><strong>正常说话</strong>；结构化结论写进 <code>.car/status.json</code></td>
+  </tr>
+</table>
+
+<p>状态的取用顺序是三级回退，任何一级命中就够：</p>
+<ol>
+  <li><strong>项目根目录的 <code>.car/status.json</code></strong>（首选）。已写进
+      <code>.git/info/exclude</code>（<strong>不动</strong>你被跟踪的 <code>.gitignore</code>），
+      且<strong>每轮开始前会先清空</strong>——否则上一轮的陈旧结论会被当成本轮结果。</li>
+  <li>回复正文里的 JSON（兼容既有线程，以及模型偶尔自作主张）。</li>
+  <li>app-server 原生信号：<code>thread/goal/get</code> 的 <code>blocked</code> / <code>complete</code>，
+      以及 <code>thread/status/changed</code> 的 <code>activeFlags: [waitingOnUserInput | waitingOnApproval]</code>。
+      这条不需要模型配合，但无 goal 的线程拿不到 <code>completed</code> / <code>blocked</code>。</li>
+</ol>
+
+<div class="callout c-info">
+  <p><strong>只读沙盒的任务</strong>（<code>sandboxMode=readOnly</code>）写不了盘，自动跳过第 1 级，
+  只用正文 + 原生信号。</p>
+</div>
 
 <h2 id="verify">5. 如何确认它真在跑</h2>
 
@@ -590,6 +632,15 @@ daemon 与桌面版共享它，所以续跑的产出对 GUI 是可见的——�
   <tr>
     <td>daemon 无法由 agent 常驻拉起</td>
     <td>需要长期后台运行请双击 <code>start-daemon.cmd</code>，或用启动文件夹（登录时生效）。</td>
+  </tr>
+  <tr>
+    <td>状态通道三条腿各有边界</td>
+    <td>
+      <code>.car/status.json</code> 依赖模型真的写了这个文件，且<strong>只读沙盒的任务用不了</strong>；
+      原生信号里，<strong>无 goal 的线程</strong>拿不到 <code>completed</code> / <code>blocked</code>。
+      三条都落空时该回合按 <code>needs_continue</code> 处理（会继续跑，靠
+      <code>maxRunCycles</code> 与无进展检测兜住，不会无限循环）。
+    </td>
   </tr>
 </table>
 

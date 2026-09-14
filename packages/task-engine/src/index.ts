@@ -6,14 +6,23 @@
  *  - new_thread 的 turn/start 注入「原始目标 + 验收标准 + 恢复上下文」
  *  - resume/imported 线程只触发继续，让 Codex 读取原会话上下文
  *  - 监听 turn/started、turn/completed、turn/diff/updated、thread/status/changed 等通知
- *  - 解析结构化 CompletionResult（按 COMPLETION_SCHEMA）
+ *  - 取回合状态：**优先读项目里的状态文件**，其次兼容旧行为（回复正文里的 JSON），
+ *    最后回退到 app-server 原生信号（goal 状态 / activeFlags）
  *  - 额度不足识别（失败 + 读取额度桶）→ WAITING_QUOTA + 保存检查点
  *  - 进展哈希 + 无进展检测
+ *
+ * 为什么不把 JSON 当主通道（2026-09-14 改）：
+ *   `turn/start` 的 `outputSchema` 定义原文是 *constrain the **final assistant message*** ——
+ *   也就是说 JSON 必须是那条可见回复本身，用户会在桌面版里看到一整坨结构化数据。
+ *   turn/start 也没有「不可见上下文」通道（`UserInput` 只有 text/image/localImage/skill/mention），
+ *   所以「让模型吐 JSON 但用户看不见」在协议层就做不到。改为让模型正常说话 + 状态落盘。
  *
  * 真实协议已探针验证（v0.142.3）：
  *   thread/start -> { thread:{ id, sessionId, status:{type} }, model, sandbox, ... }
  *   turn/start   -> { turn:{ id, status:"inProgress" } }
  *   turn/completed 通知 -> { threadId, turn:{ id, status:"completed"|"failed"|"interrupted", error? } }
+ *   thread/status/changed -> { threadId, status:{ type:"idle"|"active"|..., activeFlags?:("waitingOnApproval"|"waitingOnUserInput")[] } }
+ *   thread/goal/get -> { goal:{ status:"active"|"paused"|"blocked"|"usageLimited"|"budgetLimited"|"complete" } | null }
  */
 
 import { AppServerClient, isWriterConflict } from "@car/app-server-client";
@@ -21,12 +30,21 @@ import { registerThreadInDesktop } from "@car/desktop-registry";
 import type { Logger } from "@car/logger";
 import { SqliteRepository } from "@car/persistence";
 import type { ManagedTask } from "@car/persistence";
-import { progressHash, COMPLETION_SCHEMA, runValidations, validationsPassed, type CompletionResult, type ValidationResult } from "@car/validator";
+import { progressHash, runValidations, validationsPassed, type CompletionResult, type ValidationResult } from "@car/validator";
 import { inspect as inspectGit } from "@car/git-guard";
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+
+/** 状态文件放在项目根的哪个位置（相对 projectPath，用正斜杠书写） */
+const STATUS_DIR = ".car";
+const STATUS_FILE = "status.json";
+/** 提示词里写给模型看的路径；CAR 自己按平台拼接时用 join() */
+const STATUS_REL_FOR_PROMPT = ".car/status.json";
+
+/** 第 2 轮起只发这句 —— 完整指令上一轮已经写进 thread 历史了 */
+const CONTINUE_NUDGE = "继续任务。";
 
 export type SandboxPolicyParam =
   | { type: "workspaceWrite"; networkAccess?: boolean; writableRoots?: string[] }
@@ -55,6 +73,14 @@ export interface TaskEngineOptions {
    * 就会去改用户桌面版的状态文件。
    */
   desktopRegistry?: { enabled?: boolean; codexHome?: string };
+  /**
+   * 状态文件通道（见文件头「为什么不把 JSON 当主通道」）。
+   *
+   * 默认启用：让模型把结构化结论写进 `<projectPath>/.car/status.json`，
+   * 回复本身保持正常对话。`CAR_STATUS_FILE=0` 可关；关掉后退回「解析回复正文里的 JSON」。
+   * 只读沙盒的任务永远不走这条通道（写不了盘）。
+   */
+  statusFile?: { enabled?: boolean };
 }
 
 /** 单回合执行结果 */
@@ -73,9 +99,13 @@ export class TaskEngine {
   private readonly tasksDir: string;
   private readonly maxForksPerTask: number;
   private readonly desktopRegistry: { enabled: boolean; codexHome?: string };
+  private readonly statusFileEnabled: boolean;
 
-  /** 当前等待中的回合：threadId -> resolve */
-  private readonly pendingTurns = new Map<string, (o: TurnOutcome) => void>();
+  /** 当前等待中的回合：threadId -> { resolve, task }（要 task 才知道状态文件在哪） */
+  private readonly pendingTurns = new Map<string, { resolve: (o: TurnOutcome) => void; task: ManagedTask }>();
+
+  /** 最近一次 thread/status/changed 的原始状态（原生信号兜底用） */
+  private readonly threadStatuses = new Map<string, { type?: string; activeFlags?: string[] }>();
 
   constructor(opts: TaskEngineOptions) {
     this.client = opts.client;
@@ -84,6 +114,7 @@ export class TaskEngine {
     const local = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
     this.tasksDir = opts.tasksDir ?? join(local, "CodexAutoRunner", "tasks");
     this.maxForksPerTask = opts.maxForksPerTask ?? 5;
+    this.statusFileEnabled = opts.statusFile?.enabled ?? process.env.CAR_STATUS_FILE !== "0";
     this.desktopRegistry = {
       enabled: opts.desktopRegistry?.enabled ?? process.env.CAR_DESKTOP_REGISTRY !== "0",
       codexHome: opts.desktopRegistry?.codexHome,
@@ -115,13 +146,16 @@ export class TaskEngine {
     // 2. 启动回合
     this.repo.transitionInTx(task.id, "STARTING_THREAD", "RUNNING");
     const prompt = this.buildPrompt(task);
+    // 清掉上一轮的状态文件残留 —— 否则本轮可能把陈旧结论当成这一轮的结果
+    this.prepareStatusFile(task);
+    // 刻意不传 outputSchema：它会把「最终那条 assistant 消息」压成 JSON，
+    // 而那条消息就是用户在桌面版里看到的东西。状态改走状态文件 / 原生信号。
     const turnResp = await this.client.request<{ turn?: { id?: string } }>("turn/start", {
       threadId,
       input: [{ type: "text", text: prompt }],
       cwd: task.projectPath,
       sandboxPolicy: this.sandboxFor(task),
       approvalPolicy: this.approvalFor(task),
-      outputSchema: COMPLETION_SCHEMA,
     });
     const turnId = turnResp.turn?.id;
     if (!turnId) throw new Error("turn/start returned no turn.id");
@@ -130,7 +164,7 @@ export class TaskEngine {
     log.info("turn started", { turnId, runId });
 
     // 3. 等待 turn/completed
-    const outcome = await this.awaitTurnCompletion(threadId, turnId);
+    const outcome = await this.awaitTurnCompletion(task, threadId, turnId);
     this.repo.appendEvent(task.id, "turn/completed", outcome, runId);
 
     // 4. 处理结果
@@ -395,8 +429,16 @@ export class TaskEngine {
     else if (method === "turn/started") this.repo.appendEvent(null, "turn/started", params);
     else if (method === "turn/diff/updated") this.repo.appendEvent(null, "turn/diff/updated", params);
     else if (method === "turn/plan/updated") this.repo.appendEvent(null, "turn/plan/updated", params);
-    else if (method === "thread/status/changed") this.repo.appendEvent(null, "thread/status/changed", params);
-    else if (method === "account/rateLimits/updated") this.repo.appendEvent(null, "account/rateLimits/updated", params);
+    else if (method === "thread/status/changed") {
+      this.repo.appendEvent(null, "thread/status/changed", params);
+      this.rememberThreadStatus(params);
+    } else if (method === "account/rateLimits/updated") this.repo.appendEvent(null, "account/rateLimits/updated", params);
+  }
+
+  /** 缓存 thread/status/changed —— 原生信号兜底用（activeFlags 里能看出「在等用户」） */
+  private rememberThreadStatus(params: unknown): void {
+    const q = params as { threadId?: string; status?: { type?: string; activeFlags?: string[] } };
+    if (q.threadId) this.threadStatuses.set(q.threadId, q.status ?? {});
   }
 
   private handleTurnCompleted(params: unknown): void {
@@ -404,8 +446,9 @@ export class TaskEngine {
     const threadId = p.threadId;
     const turnId = p.turn?.id;
     if (!threadId) return;
-    const resolver = this.pendingTurns.get(threadId);
-    if (!resolver) return;
+    const pending = this.pendingTurns.get(threadId);
+    if (!pending) return;
+    const resolver = pending.resolve;
 
     const turnStatus = (p.turn?.status ?? "failed") as TurnOutcome["status"];
     const errMsg = p.turn?.error?.message ?? null;
@@ -422,10 +465,18 @@ export class TaskEngine {
     }
 
     if (turnStatus === "completed") {
-      const result = extractCompletionResult(p.turn);
-      const status = (result?.status ?? "needs_continue") as TurnOutcome["status"];
-      resolver({ status, result, validations: [], raw: params, error: errMsg });
-      this.pendingTurns.delete(threadId);
+      // 取状态的顺序：状态文件 → 回复正文里的 JSON（兼容旧线程）→ 原生信号。
+      // 前两步是同步的，只有第三步要发 RPC，所以整体异步化。
+      void this.resolveCompleted(pending.task, threadId, p.turn)
+        .then((outcome) => {
+          resolver(outcome);
+          this.pendingTurns.delete(threadId);
+        })
+        .catch((err) => {
+          this.log.warn("resolveCompleted failed; falling back to needs_continue", { threadId, err: String(err) });
+          resolver({ status: "needs_continue", result: null, validations: [], raw: params, error: errMsg });
+          this.pendingTurns.delete(threadId);
+        });
       return;
     }
 
@@ -440,7 +491,7 @@ export class TaskEngine {
     this.pendingTurns.delete(threadId);
   }
 
-  private awaitTurnCompletion(threadId: string, turnId: string): Promise<TurnOutcome> {
+  private awaitTurnCompletion(task: ManagedTask, threadId: string, turnId: string): Promise<TurnOutcome> {
     return new Promise<TurnOutcome>((resolve) => {
       let quotaPollBusy = false;
       const cleanup = () => {
@@ -452,7 +503,7 @@ export class TaskEngine {
         cleanup();
         resolve(outcome);
       };
-      this.pendingTurns.set(threadId, finish);
+      this.pendingTurns.set(threadId, { resolve: finish, task });
       const quotaPoll = setInterval(() => {
         if (!this.pendingTurns.has(threadId) || quotaPollBusy) return;
         quotaPollBusy = true;
@@ -515,12 +566,8 @@ export class TaskEngine {
       task.acceptanceCriteria.forEach((c, i) => lines.push(`${i + 1}. ${c}`));
     }
     lines.push("");
-    lines.push("要求：");
-    lines.push("1. 不要自动 push、部署或发布。");
-    lines.push("2. 不要修改 Git 历史（reset --hard、push --force、clean -fd 等）。");
-    lines.push("3. 遇到需要高风险权限或歧义时停止并返回 needs_user。");
-    lines.push("4. 完成后请严格按 outputSchema 返回 JSON 结果。");
-    lines.push("5. remaining_items 为空且所有验证通过才算 completed。");
+    lines.push(this.statusProtocol(task));
+    lines.push(this.constraints());
     return lines.join("\n");
   }
 
@@ -530,22 +577,26 @@ export class TaskEngine {
    * 不依赖 Codex 的 goal 模式：goal 存在与否都能继续。
    * 依靠的是 thread 自身的历史上下文 + 本指令，
    * 因此无 goal 会话同样可以被接管并跨额度窗口续跑。
+   *
+   * 第 2 轮起只发一句「继续任务。」—— 完整指令上一轮已经写进 thread 历史了，
+   * 每轮整份重发只会把对话刷成一堵墙（用户实测反馈：太乱，不算续跑成功）。
    */
   private buildResumePrompt(task: ManagedTask): string {
+    if (task.runCycleCount > 0) return CONTINUE_NUDGE;
+
     const lines: string[] = [];
-    lines.push("你正在被 Codex Auto Runner 恢复执行一个之前中断的任务。");
-    lines.push("这是之前会话的延续，你之前的历史上下文都还在。");
+    lines.push("继续任务。");
     lines.push("");
-    lines.push("请先回顾本会话中你上一次正在做的事，从中断的地方继续推进。");
-    lines.push("不要重头开始，不要开启新话题，不要重复询问已经得到过的信息。");
+    lines.push("这是之前会话的延续，你之前的历史上下文都还在；");
+    lines.push("请从中断的地方接着做，不要重头开始、不要换话题、不要重复询问已经得到过的信息。");
     if (task.originalGoal?.trim()) {
       lines.push("");
-      lines.push("本次要推进的工作：");
+      lines.push("要推进的工作：");
       lines.push(task.originalGoal.trim());
     }
     if (task.resumeInstruction?.trim()) {
       lines.push("");
-      lines.push("恢复指令：");
+      lines.push("补充说明：");
       lines.push(task.resumeInstruction.trim());
     }
     if (task.acceptanceCriteria.length) {
@@ -554,13 +605,151 @@ export class TaskEngine {
       task.acceptanceCriteria.forEach((c, i) => lines.push(`${i + 1}. ${c}`));
     }
     lines.push("");
-    lines.push("要求：");
-    lines.push("1. 不要自动 push、部署或发布。");
-    lines.push("2. 不要修改 Git 历史（reset --hard、push --force、clean -fd 等）。");
-    lines.push("3. 遇到需要高风险权限或歧义时停止并返回 needs_user。");
-    lines.push("4. 完成后请严格按 outputSchema 返回 JSON 结果。");
-    lines.push("5. remaining_items 为空且所有验证通过才算 completed。");
+    lines.push(this.statusProtocol(task));
+    lines.push(this.constraints());
     return lines.join("\n");
+  }
+
+  /**
+   * 收尾协议。
+   *
+   * 为什么不让它直接输出 JSON：`turn/start` 的 `outputSchema` 约束的是
+   * **最终那条 assistant 消息**，也就是用户在桌面版里看到的那条 —— 要求 JSON
+   * 就等于把一坨结构化数据糊到用户脸上。改成写文件，对话保持正常说话。
+   *
+   * 只读沙盒写不了盘，退回「正常说话 + 原生信号兜底」。
+   */
+  private statusProtocol(task: ManagedTask): string {
+    if (!this.statusFileEnabled || task.sandboxMode === "readOnly") {
+      return "结束前用一段正常的话说明：做了什么、还剩什么、有没有需要我拍板的地方。（不要输出 JSON）";
+    }
+    const rel = STATUS_REL_FOR_PROMPT;
+    return [
+      "结束前，把结构化结论写进项目根目录的 " + rel + "（本轮唯一的固定产物，已 gitignore）：",
+      '  {"status":"completed|needs_continue|needs_user|blocked","summary":"一句话",',
+      '   "completed_items":[],"remaining_items":[],"changed_files":[],"needs_user_reason":null}',
+      "回复本身正常说话就行 —— 不要把这坨 JSON 打进对话里。",
+    ].join("\n");
+  }
+
+  /**
+   * 安全约束压成一行。
+   * 语义一条不丢（不 push/不部署、不改 Git 历史、要授权就走 needs_user、真正的完成判定），
+   * 但不再占用 5 行版面 —— 早先每轮刷 5 行是「太乱」的主要来源之一。
+   */
+  private constraints(): string {
+    return (
+      "约束：不 push / 不部署 / 不发布；不改 Git 历史（reset --hard、push --force、clean -fd）；" +
+      "高风险或拿不准就停下来标记 needs_user 交回给我；remaining_items 清空且验证全过才算 completed。"
+    );
+  }
+
+  /* --------------------------- 状态通道 --------------------------- */
+
+  /**
+   * 开回合前：清掉上一轮的状态文件残留，并把 `.car/` 加进项目的 git exclude。
+   *
+   * 必须清残留 —— 否则模型这轮没写文件时，CAR 会把上一轮的结论当成这一轮的结果。
+   */
+  private prepareStatusFile(task: ManagedTask): void {
+    if (!this.statusFileEnabled || task.sandboxMode === "readOnly") return;
+    try {
+      rmSync(join(task.projectPath, STATUS_DIR, STATUS_FILE), { force: true });
+      this.ensureGitExcluded(task.projectPath);
+      mkdirSync(join(task.projectPath, STATUS_DIR), { recursive: true });
+    } catch {
+      /* 状态文件只是取状态的一条通道，准备失败不影响主流程 */
+    }
+  }
+
+  /**
+   * 把 `.car/` 写进 `<repo>/.git/info/exclude`。
+   *
+   * 刻意不动被跟踪的 `.gitignore` —— 那是用户的仓库内容，CAR 无权改。
+   * `.git/info/exclude` 只作用于本地、不进版本库，正好放这种「工具自己的临时产物」。
+   * `.git` 是文件（worktree）或不是 git 仓库时直接跳过。
+   */
+  private ensureGitExcluded(projectPath: string): void {
+    try {
+      const exclude = join(projectPath, ".git", "info", "exclude");
+      if (!existsSync(exclude)) return;
+      const marker = `${STATUS_DIR}/`;
+      const current = readFileSync(exclude, "utf8");
+      if (current.split(/\r?\n/).some((l) => l.trim() === marker)) return;
+      appendFileSync(exclude, `\n# Codex Auto Runner 状态文件\n${marker}\n`, "utf8");
+    } catch {
+      /* 加不上就加不上：大不了 git status 里多一个未跟踪目录 */
+    }
+  }
+
+  /** 读本轮的状态文件；不存在 / 解析不了 / 形状不对一律返回 null */
+  private readStatusFile(task: ManagedTask): CompletionResult | null {
+    if (!this.statusFileEnabled || task.sandboxMode === "readOnly") return null;
+    try {
+      const raw = readFileSync(join(task.projectPath, STATUS_DIR, STATUS_FILE), "utf8");
+      const parsed: unknown = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return null;
+      const status = (parsed as { status?: unknown }).status;
+      if (typeof status !== "string") return null;
+      return normalizeCompletionResult(parsed as Record<string, unknown>);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 取一个已完成回合的结论。三级回退，任何一级命中就返回：
+   *   1. 项目里的状态文件（新通道，首选）
+   *   2. 回复正文里的 JSON（兼容旧线程 / 模型自作主张吐了 JSON）
+   *   3. app-server 原生信号（goal 状态 + thread/status/changed 的 activeFlags）
+   * 三级都不命中就返回 null，调用方会退化成 needs_continue。
+   */
+  private async resolveCompleted(task: ManagedTask, threadId: string, turn: unknown): Promise<TurnOutcome> {
+    let result = this.readStatusFile(task);
+    let source = "status-file";
+
+    if (!result) {
+      result = extractCompletionResult(turn);
+      source = "reply-json";
+    }
+
+    if (!result) {
+      result = await this.nativeResult(threadId);
+      source = "native-signal";
+    }
+
+    const status = (result?.status ?? "needs_continue") as TurnOutcome["status"];
+    this.log.debug("resolved turn result", { threadId, source, status });
+    return { status, result, validations: [], raw: turn, error: null };
+  }
+
+  /**
+   * 原生信号兜底：不需要模型配合，从 app-server 自己的状态里读出结论。
+   *
+   * - goal.status = blocked            → needs_user
+   * - goal.status = complete           → completed
+   * - activeFlags 含 waitingOnUser*    → needs_user（正在等用户输入/审批）
+   * - 其它                             → null（上层退化成 needs_continue）
+   *
+   * 无 goal 的线程拿不到 completed/blocked，这是这条通道的已知边界。
+   */
+  private async nativeResult(threadId: string): Promise<CompletionResult | null> {
+    const flags = this.threadStatuses.get(threadId)?.activeFlags ?? [];
+    if (flags.includes("waitingOnUserInput") || flags.includes("waitingOnApproval")) {
+      return makeNativeResult("needs_user", `线程正在等待用户输入（activeFlags=${flags.join(",")}）`);
+    }
+
+    let goalStatus: string | undefined;
+    try {
+      const resp = await this.client.request<{ goal?: { status?: string } | null }>("thread/goal/get", { threadId });
+      goalStatus = resp.goal?.status;
+    } catch (err) {
+      this.log.debug("goal status probe failed", { threadId, err: String(err) });
+    }
+
+    if (goalStatus === "blocked") return makeNativeResult("needs_user", "线程目标被标记为 blocked");
+    if (goalStatus === "complete") return makeNativeResult("completed", "线程目标已被标记为 complete");
+    return null;
   }
 
   private diffHash(cwd: string): string {
@@ -785,4 +974,40 @@ function tryParseJsonFromText(text: string): unknown {
     try { return JSON.parse(text.slice(start, end + 1)); } catch { /* continue */ }
   }
   return null;
+}
+
+/**
+ * 把状态文件里的对象补齐成完整的 CompletionResult。
+ *
+ * 模型只写必要字段是常态 —— 缺字段一律补空值，而不是判定「失败」，
+ * 否则一个漏写 `risk_notes` 的回合就会让 CAR 丢掉整个状态。
+ */
+function normalizeCompletionResult(obj: Record<string, unknown>): CompletionResult {
+  const strArr = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  const status = typeof obj.status === "string" ? obj.status : "needs_continue";
+  return {
+    status: status as CompletionResult["status"],
+    summary: typeof obj.summary === "string" ? obj.summary : "",
+    completed_items: strArr(obj.completed_items),
+    remaining_items: strArr(obj.remaining_items),
+    changed_files: strArr(obj.changed_files),
+    recommended_validation: strArr(obj.recommended_validation),
+    needs_user_reason: typeof obj.needs_user_reason === "string" ? obj.needs_user_reason : null,
+    risk_notes: strArr(obj.risk_notes),
+  };
+}
+
+/** 由原生信号合成一个最小结论（模型没给状态时用） */
+function makeNativeResult(status: CompletionResult["status"], summary: string): CompletionResult {
+  return {
+    status,
+    summary,
+    completed_items: [],
+    remaining_items: [],
+    changed_files: [],
+    recommended_validation: [],
+    needs_user_reason: status === "needs_user" ? summary : null,
+    risk_notes: [],
+  };
 }
