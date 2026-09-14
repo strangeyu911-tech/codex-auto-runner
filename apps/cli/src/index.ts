@@ -151,16 +151,29 @@ async function cmdDesktop(sub: string | undefined, opts: Record<string, string>)
     return;
   }
 
-  // 回读自检：桌面版开着时它下一次写盘会把我们的改动覆盖掉，
-  // 与其报一个假的「成功」，不如当场告诉用户该怎么做。
-  await sleep(1500);
-  const lost = targets.filter((t) => !isThreadRegistered({ threadId: t.threadId, codexHome }));
-  if (lost.length === 0) {
-    process.stdout.write("\n✓ 回读确认：登记已落盘。完全退出 Codex 桌面版再打开即可看到。\n");
+  // 回读自检：桌面版运行中会回写状态文件（实测：写进去的登记在 11 分钟内被抹掉），
+  // 与其报一个假的「成功」，不如当场把真实预期讲清楚。
+  const lost = [];
+  for (const waitMs of [2000, 6000, 12000]) {
+    await sleep(waitMs);
+    const gone = targets.filter((t) => !isThreadRegistered({ threadId: t.threadId, codexHome }));
+    if (gone.length > 0) {
+      lost.push(...gone);
+      break;
+    }
+  }
+
+  if (lost.length > 0) {
+    process.stdout.write(
+      `\n⚠ 登记被覆盖了（${lost.length} 条）—— Codex 桌面版正在运行，它的状态在内存里，回写时会把我们加的条目丢掉。\n` +
+        "  可靠顺序只有一种：**完全退出桌面版**（托盘也要退）→ 再跑一次本命令 → 然后才打开桌面版。\n",
+    );
   } else {
     process.stdout.write(
-      `\n⚠ 有 ${lost.length} 条刚写进去就被覆盖了 —— Codex 桌面版正在运行，它的状态在内存里。\n` +
-        "  请**完全退出桌面版**（托盘也要退），再跑一次 `car desktop fix`，然后重新打开。\n",
+      "\n✓ 回读确认：登记已落盘，20 秒内未被覆盖。\n" +
+        "  但桌面版运行中随时可能回写状态把这条登记抹掉 —— 只要它开着，就请用这个顺序：\n" +
+        "    完全退出桌面版 → 跑本命令 → 打开桌面版。\n" +
+        "  （daemon 在跑的话也会每 2 分钟自愈重试，桌面版关闭期间会自动补上。）\n",
     );
   }
 }
