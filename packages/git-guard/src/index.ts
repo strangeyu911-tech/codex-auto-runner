@@ -65,6 +65,29 @@ export function prepareForRun(cwd: string, opts: { allowDirty?: boolean } = {}):
   return { ok: true, state };
 }
 
+/**
+ * 哪些任务即便工作区脏也允许启动。
+ *
+ * `prepareForRun` 默认要求工作区干净，是为了让 CAR 跑出来的改动可归因。
+ * 但对下面两类任务，这个前提不成立：
+ *   - `readOnly` 沙箱：Codex 在沙箱层就被禁止写文件，脏工作区没有额外风险；
+ *   - 续跑已有线程（`resume_thread` / `imported_thread`）：这是回到那个线程**自己的工作区**
+ *     接着干，未提交的改动往往就是它自己留下的。拦在这里的后果是「仓库越活跃越无法续跑」，
+ *     而活跃仓库恰恰最容易被额度打断、最需要自动接管。
+ * `worktree` 模式本来就跑在独立副本里，主工作区脏不脏与它无关。
+ */
+export interface TaskDirtyPolicyInput {
+  mode: string;
+  sandboxMode: string;
+  workspaceMode: string;
+}
+
+export function toleratesDirtyWorktree(task: TaskDirtyPolicyInput): boolean {
+  if (task.workspaceMode === "worktree") return true;
+  if (task.sandboxMode === "readOnly") return true;
+  return task.mode === "resume_thread" || task.mode === "imported_thread";
+}
+
 /** 暂停期间用户修改检测 */
 export interface PauseChange {
   changed: boolean;

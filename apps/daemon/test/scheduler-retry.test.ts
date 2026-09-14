@@ -13,7 +13,8 @@
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteRepository } from "@car/persistence";
@@ -286,6 +287,65 @@ test("discovery: a failing scan must not break the scheduling loop", async () =>
   await scheduler.tick();
 
   assert.deepEqual(calls, [t.id], "discovery errors are swallowed; the task still runs");
+  repo.close();
+});
+
+// ---------------------------------------------------------------------------
+// git 闸门 与 续跑任务
+//
+// prepareForRun 默认要求工作区干净，这对 resume_thread 任务是语义错位：它要回到线程
+// **自己的工作区**接着干，那里有未提交改动是常态（往往就是它自己被打断时留下的）。
+// 实测桌面端那条任务就因此停在 WAITING_USER（last_error: 工作区不干净；需要显式授权），
+// 连 resume / fork 都没走到。这里用真 git 仓库验两侧：放行续跑，且没有顺手把闸门拆了。
+// ---------------------------------------------------------------------------
+
+/** 造一个真 git 仓库并弄脏它；返回是否成功（无 git 则用例跳过） */
+function initDirtyGitRepo(dir: string): boolean {
+  const opts = { cwd: dir, windowsHide: true, encoding: "utf8" as const };
+  if ((spawnSync("git", ["init", "-q"], opts).status ?? -1) !== 0) return false;
+  writeFileSync(join(dir, "wip.txt"), "uncommitted work\n");
+  const st = spawnSync("git", ["status", "--porcelain=v1"], opts);
+  return (st.status ?? -1) === 0 && (st.stdout ?? "").includes("wip.txt");
+}
+
+test("git guard: a resumed thread is let back into its own dirty workspace", async (t) => {
+  const { repo } = setup();
+  const project = makeProject();
+  if (!initDirtyGitRepo(project)) {
+    t.skip("git unavailable");
+    return;
+  }
+  const task = repo.createTask({
+    title: "resume into a dirty tree", projectPath: project, originalGoal: "g", priority: 50,
+    mode: "resume_thread", threadId: "th-dirty", sandboxMode: "workspaceWrite",
+  });
+
+  const { scheduler, calls } = makeScheduler(repo);
+  await scheduler.tick();
+
+  assert.deepEqual(calls, [task.id], "the git guard must not park a resumed thread");
+  assert.notEqual(repo.getTask(task.id)?.status, "WAITING_USER");
+  repo.close();
+});
+
+test("git guard: a brand-new write task is still parked on a dirty workspace", async (t) => {
+  const { repo } = setup();
+  const project = makeProject();
+  if (!initDirtyGitRepo(project)) {
+    t.skip("git unavailable");
+    return;
+  }
+  const task = repo.createTask({
+    title: "fresh write task", projectPath: project, originalGoal: "g", priority: 50,
+    mode: "new_thread", sandboxMode: "workspaceWrite",
+  });
+
+  const { scheduler, calls } = makeScheduler(repo);
+  await scheduler.tick();
+
+  assert.deepEqual(calls, [], "a new write task must still wait for a clean tree");
+  assert.equal(repo.getTask(task.id)?.status, "WAITING_USER");
+  assert.ok(repo.getTask(task.id)?.lastError?.includes("工作区不干净"), "keeps the original reason");
   repo.close();
 });
 

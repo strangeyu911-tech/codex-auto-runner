@@ -25,7 +25,7 @@ import type { Logger } from "@car/logger";
 import { SqliteRepository } from "@car/persistence";
 import type { ManagedTask } from "@car/persistence";
 import { TaskEngine } from "@car/task-engine";
-import { prepareForRun } from "@car/git-guard";
+import { prepareForRun, toleratesDirtyWorktree } from "@car/git-guard";
 import type { QuotaSnapshot } from "@car/quota-engine";
 import { DEFAULT_DISCOVERY, runDiscovery, type DiscoveryConfig } from "./discovery.js";
 import { randomUUID } from "node:crypto";
@@ -266,16 +266,25 @@ export class Scheduler {
       this.repo.patch(task.id, { lastError: "project locked", nextRunAt: Date.now() + 5 * 60_000 });
       return;
     }
-    // git 准备
-    const prep = prepareForRun(task.projectPath, {
-      allowDirty: task.workspaceMode === "worktree" || process.env.CAR_ALLOW_DIRTY === "1",
-    });
+    // git 准备。续跑/只读类任务允许脏工作区（见 toleratesDirtyWorktree）——
+    // 否则「回到线程自己的工作区接着干」会被这条闸门永久停在 WAITING_USER。
+    const allowDirty = toleratesDirtyWorktree(task) || process.env.CAR_ALLOW_DIRTY === "1";
+    const prep = prepareForRun(task.projectPath, { allowDirty });
     if (!prep.ok) {
       log.warn("git prepare failed", { reason: prep.reason });
       this.repo.forceStatus(task.id, "WAITING_USER");
       this.repo.patch(task.id, { lastError: prep.reason ?? "git guard" });
       this.repo.releaseProjectLock(task.projectPath);
       return;
+    }
+    if (prep.state.porcelain.length > 0) {
+      // 放行的脏工作区留痕：日后排查「为什么它在脏仓库里跑起来了」有据可查。
+      log.info("dirty worktree tolerated", {
+        mode: task.mode,
+        sandboxMode: task.sandboxMode,
+        workspaceMode: task.workspaceMode,
+        files: prep.state.porcelain.length,
+      });
     }
 
     try {

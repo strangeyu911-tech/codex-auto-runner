@@ -30,6 +30,7 @@ export default defineConfig({
     include: [
       "packages/quota-engine/test/**/*.test.ts",
       "packages/task-engine/test/**/*.test.ts",
+      "packages/git-guard/test/**/*.test.ts",
       "test/**/*.test.ts",
     ],
     // 根 test/ 下的端到端用例依赖 node:sqlite 内置模块，vitest 的解析器处理不了，
