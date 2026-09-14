@@ -202,7 +202,18 @@ function completeTurnAfter(client: FakeClient, threadId: string, turnId = "turn-
       turn: {
         id: turnId,
         status: "completed",
-        items: [{ type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+        itemsView: "full",
+        // 真实形状：文本在 item.text 上（codex 0.153.4 没有 content[] 数组）
+        items: [
+          {
+            type: "agentMessage",
+            id: "msg-1",
+            text,
+            phase: null,
+            memoryCitation: null,
+            delivery: null,
+          },
+        ],
       },
     });
   }, 0);

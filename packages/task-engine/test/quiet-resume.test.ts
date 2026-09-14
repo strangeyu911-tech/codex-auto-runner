@@ -184,12 +184,18 @@ function harness(opts: { task?: Partial<ManagedTask>; goalStatus?: string | null
 
 /**
  * 跑一轮：启动 turn，然后在下一轮宏任务里完成它。
+ *
  * `replyText` 是模型「正常说话」的回复（默认不含任何 JSON）。
+ *
+ * ⚠️ 这里必须用**真实载荷形状**：codex 0.153.4 的 turn/completed 里，
+ * assistant 文本直接挂在 `item.text` 上（item 键为 type/id/text/phase/…），
+ * 没有 `content[]` 数组。若照 `content[].text` 造数据，测试会全绿而真机全崩
+ * —— 这正是「模型说 needs_user、CAR 读成 needs_continue」那个 bug 的成因。
  */
 async function runTurn(
   h: ReturnType<typeof harness>,
   task: ManagedTask,
-  opts: { replyText?: string; duringTurn?: () => void; threadId?: string } = {},
+  opts: { replyText?: string; replyPhase?: string | null; extraItems?: unknown[]; duringTurn?: () => void; threadId?: string } = {},
 ) {
   const threadId = opts.threadId ?? task.threadId ?? "parent-1";
   const p = h.engine.runOneTurn(task);
@@ -200,12 +206,17 @@ async function runTurn(
       turn: {
         id: "turn-1",
         status: "completed",
+        itemsView: "full",
         items: [
           {
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: opts.replyText ?? "这轮把迁移脚本的第二步跑通了，剩下的在下一步。" }],
+            type: "agentMessage",
+            id: "msg-1",
+            text: opts.replyText ?? "这轮把迁移脚本的第二步跑通了，剩下的在下一步。",
+            phase: opts.replyPhase ?? null,
+            memoryCitation: null,
+            delivery: null,
           },
+          ...(opts.extraItems ?? []),
         ],
       },
     });
@@ -252,6 +263,76 @@ describe("续跑 prompt 不再刷屏", () => {
     for (const call of h.client.callsOf("turn/start")) {
       expect(call.params["outputSchema"]).toBeUndefined();
     }
+  });
+});
+
+/**
+ * 回归：真实载荷形状必须能被解析。
+ *
+ * 背景（实测 2026-09-15）：codex 0.153.4 的 turn/completed 里 assistant 文本挂在
+ * `item.text` 上，旧代码却按 `item.content[].text` 取，取到空数组 → 永远 null。
+ * 后果不是「少了个字段」而是**任务不会停**：模型说 needs_user，CAR 读成
+ * needs_continue，于是反复续跑、反复烧额度。
+ */
+describe("回复正文通道（兼容旧线程时的兜底）", () => {
+  it("真实形状 items[].text 里的结论会被采纳", async () => {
+    const h = harness();
+    const outcome = await runTurn(h, h.repo.getTask("task-1")!, {
+      replyText: JSON.stringify({ status: "completed", summary: "都做完了", remaining_items: [] }),
+    });
+    expect(outcome.status).toBe("completed");
+    expect(outcome.result?.summary).toBe("都做完了");
+  });
+
+  it("模型说 needs_user 时不会被读成 needs_continue（否则会无限续跑）", async () => {
+    const h = harness();
+    const outcome = await runTurn(h, h.repo.getTask("task-1")!, {
+      replyText: JSON.stringify({
+        status: "needs_user",
+        summary: "需要你决定验收口径",
+        needs_user_reason: "两条路线都可行",
+      }),
+    });
+    expect(outcome.status).toBe("needs_user");
+    expect(outcome.result?.needs_user_reason).toBe("两条路线都可行");
+  });
+
+  it("phase=final_answer 优先于 commentary（过程叙述里也出现 JSON 时）", async () => {
+    const h = harness();
+    const outcome = await runTurn(h, h.repo.getTask("task-1")!, {
+      replyPhase: "commentary",
+      replyText: JSON.stringify({ status: "needs_continue", summary: "过程中的一版结论" }),
+      extraItems: [
+        {
+          type: "agentMessage",
+          id: "msg-2",
+          phase: "final_answer",
+          text: JSON.stringify({ status: "completed", summary: "终局结论", remaining_items: [] }),
+          memoryCitation: null,
+          delivery: null,
+        },
+      ],
+    });
+    expect(outcome.status).toBe("completed");
+    expect(outcome.result?.summary).toBe("终局结论");
+  });
+
+  it("旧形状 content[].text 仍然认得（老版本/防御性兼容）", async () => {
+    const h = harness();
+    const outcome = await runTurn(h, h.repo.getTask("task-1")!, {
+      replyText: "（这个字段不会用到）",
+      extraItems: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [
+            { type: "output_text", text: JSON.stringify({ status: "completed", summary: "老形状说的", remaining_items: [] }) },
+          ],
+        },
+      ],
+    });
+    expect(outcome.status).toBe("completed");
+    expect(outcome.result?.summary).toBe("老形状说的");
   });
 });
 

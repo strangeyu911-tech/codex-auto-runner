@@ -935,28 +935,64 @@ export function decideRecovery(input: {
   };
 }
 
-/** 从 turn/completed 的 items 中抽取结构化 CompletionResult */
+/**
+ * 从 turn/completed 的 items 中抽取结构化 CompletionResult。
+ *
+ * ⚠️ 实测（codex 0.153.4，见 `_audit/probe-turn-items-shape.mjs`）：
+ * assistant 消息的文本**直接挂在 `item.text` 上**，item 形如
+ *   { type:"agentMessage", id, text, phase, memoryCitation, delivery, questions }
+ * ——**没有 `content[]` 数组**。旧实现按 `items[].content[].text` 取值，
+ * 取到的是空数组，于是永远返回 null：模型明明说了 needs_user 也被读成
+ * needs_continue，任务于是被反复续跑、反复烧额度。这里两种形状都认。
+ *
+ * 取值优先级（依协议对 MessagePhase 的说明：provider 不一定给 phase，
+ * 因此 phase 为 null 时不能当作「非最终」）：
+ *   1. phase === "final_answer" 的 item —— 协议标注的终局答复
+ *   2. type === "agentMessage" 的 item —— 正常的助手输出
+ *   3. 其余 item（兼容旧形状 / 老版本）
+ */
 function extractCompletionResult(turn: unknown): CompletionResult | null {
-  const t = turn as { items?: Array<{ type?: string; role?: string; content?: Array<{ type?: string; text?: string }> }> };
-  const items = t?.items ?? [];
-  // 找最后一条 assistant message 文本
-  for (let i = items.length - 1; i >= 0; i--) {
-    const it = items[i];
-    if (!it) continue;
-    const contents = it.content ?? [];
-    for (let j = contents.length - 1; j >= 0; j--) {
-      const c = contents[j];
-      if (!c) continue;
-      const text = c.text;
-      if (typeof text !== "string") continue;
-      // 尝试从文本里抽 JSON（模型可能包裹在 ```json ... ```）
-      const parsed = tryParseJsonFromText(text);
-      if (parsed && typeof parsed === "object" && "status" in parsed) {
-        return parsed as CompletionResult;
+  type TurnItem = {
+    type?: string;
+    role?: string;
+    text?: string;
+    phase?: string | null;
+    content?: Array<{ type?: string; text?: string }>;
+  };
+  const t = turn as { items?: TurnItem[] };
+  const items: TurnItem[] = Array.isArray(t?.items) ? t.items : [];
+
+  /** 一个 item 可能承载的文本（真实形状给 item.text，旧形状给 content[].text） */
+  const textsOf = (it: TurnItem): string[] => {
+    const out: string[] = [];
+    if (typeof it.text === "string") out.push(it.text);
+    for (const c of it.content ?? []) {
+      if (c && typeof c.text === "string") out.push(c.text);
+    }
+    return out;
+  };
+
+  /** 从候选里倒序找第一条能解析出 status 的文本 */
+  const tryFrom = (candidates: TurnItem[]): CompletionResult | null => {
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const it = candidates[i];
+      if (!it) continue;
+      const texts = textsOf(it);
+      for (let j = texts.length - 1; j >= 0; j--) {
+        const parsed = tryParseJsonFromText(texts[j]!);
+        if (parsed && typeof parsed === "object" && "status" in parsed) {
+          return parsed as CompletionResult;
+        }
       }
     }
-  }
-  return null;
+    return null;
+  };
+
+  return (
+    tryFrom(items.filter((it) => it?.phase === "final_answer")) ??
+    tryFrom(items.filter((it) => it?.type === "agentMessage")) ??
+    tryFrom(items)
+  );
 }
 
 function tryParseJsonFromText(text: string): unknown {
