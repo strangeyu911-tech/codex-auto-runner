@@ -13,6 +13,8 @@
  *   car task cancel <id>                取消
  *   car task run-now <id>               立即运行（标记 READY，等 daemon tick）
  *   car daemon start|stop|restart       （占位；真正管理由 Windows 任务计划程序/手动）
+ *   car desktop status                  检查 CAR 造的线程有没有在桌面版侧边栏里「隐身」
+ *   car desktop fix [--dry-run]         把它们补登记进侧边栏（桌面版需重启后可见）
  *
  * 说明：pause/resume/run-now 直接写 DB；daemon 的 scheduler 在下个 tick 读取。
  *      若 daemon 未运行，状态仍写入；启动后会被处理。
@@ -20,6 +22,7 @@
 
 import { SqliteRepository, defaultDataDir, type CreateTaskInput, TERMINAL_STATUSES } from "@car/persistence";
 import type { ManagedTask } from "@car/persistence";
+import { desktopStatePath, isThreadRegistered, registerThreadInDesktop, resolveCodexHome } from "@car/desktop-registry";
 import { join } from "node:path";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -65,10 +68,105 @@ async function main(): Promise<void> {
   if (cmd === "quota") return cmdQuota();
   if (cmd === "task") return cmdTask(sub, opts);
   if (cmd === "daemon") return cmdDaemon(sub);
+  if (cmd === "desktop") return cmdDesktop(sub, opts);
 
   process.stderr.write(`unknown command: ${cmd}\n`);
-  process.stderr.write("commands: status | quota | task | daemon\n");
+  process.stderr.write("commands: status | quota | task | daemon | desktop\n");
   process.exit(2);
+}
+
+/**
+ * 桌面版侧边栏登记。
+ *
+ * 为什么需要：CAR 用 thread/start、thread/fork 造出来的线程，桌面版侧边栏看不见 ——
+ * 侧边栏认的是桌面版自己 `.codex-global-state.json` 里的成员表，而桌面版只对
+ * 「自己建的线程」和「用户改过根路径的项目」做对账。于是这类线程对用户就是隐形的，
+ * 自动续跑等于白跑。
+ *
+ * 注意：桌面版**正在运行时**写入不会被读取（状态在它内存里），需重启后可见。
+ */
+async function cmdDesktop(sub: string | undefined, opts: Record<string, string>): Promise<void> {
+  const mode = sub ?? "status";
+  if (mode !== "status" && mode !== "fix") {
+    process.stderr.write(`car desktop: unknown subcommand: ${sub}\n`);
+    process.stderr.write("usage: car desktop status | car desktop fix [--dry-run]\n");
+    process.exit(2);
+  }
+
+  const codexHome = resolveCodexHome();
+  const statePath = desktopStatePath(codexHome);
+  const dryRun = opts["dry-run"] === "true" || mode === "status";
+
+  process.stdout.write(`codex home:  ${codexHome}\n`);
+  process.stdout.write(`state file:  ${statePath}  ${existsSync(statePath) ? "(ok)" : "(不存在 → 桌面版可能还没跑过)"}\n\n`);
+
+  const repo = openRepo();
+  const tasks = repo.listTasks();
+  repo.close();
+
+  // CAR 造出来的线程 = 任务上记录的 threadId；fork 产物额外记着父线程。
+  const targets = tasks
+    .filter((t) => t.threadId)
+    .map((t) => ({
+      taskId: t.id,
+      threadId: t.threadId as string,
+      parentThreadId: t.forkedFromThreadId,
+      cwd: t.projectPath,
+      status: t.status,
+    }));
+
+  if (!targets.length) {
+    process.stdout.write("没有带线程的任务 —— 无需登记。\n");
+    return;
+  }
+
+  let changed = 0;
+  let missing = 0;
+  for (const t of targets) {
+    const res = registerThreadInDesktop({
+      threadId: t.threadId,
+      parentThreadId: t.parentThreadId,
+      cwd: t.cwd,
+      codexHome,
+      dryRun,
+    });
+    const mark = !res.ok ? "✗" : res.changed ? (dryRun ? "•" : "✓") : "=";
+    if (!res.ok) missing++;
+    else if (res.changed) changed++;
+    process.stdout.write(
+      `  ${mark} ${t.threadId.slice(0, 8)}  [${t.status}]  task=${t.taskId}  ` +
+        `${res.projectId ? "项目 " + res.projectId.slice(0, 8) : "未分组"}  ${res.reason}\n`,
+    );
+  }
+
+  process.stdout.write(`\n${targets.length} 条线程：需要登记 ${changed} 条，无法登记 ${missing} 条。\n`);
+  process.stdout.write("图例：= 已登记  • 待登记(演练)  ✓ 已写入  ✗ 跳过\n");
+  if (dryRun) {
+    process.stdout.write("\n这是演练，没有写盘。执行 `car desktop fix` 真正登记。\n");
+    return;
+  }
+
+  if (changed === 0) {
+    process.stdout.write("\n全部已在侧边栏里，无需重启桌面版。\n");
+    return;
+  }
+
+  // 回读自检：桌面版开着时它下一次写盘会把我们的改动覆盖掉，
+  // 与其报一个假的「成功」，不如当场告诉用户该怎么做。
+  await sleep(1500);
+  const lost = targets.filter((t) => !isThreadRegistered({ threadId: t.threadId, codexHome }));
+  if (lost.length === 0) {
+    process.stdout.write("\n✓ 回读确认：登记已落盘。完全退出 Codex 桌面版再打开即可看到。\n");
+  } else {
+    process.stdout.write(
+      `\n⚠ 有 ${lost.length} 条刚写进去就被覆盖了 —— Codex 桌面版正在运行，它的状态在内存里。\n` +
+        "  请**完全退出桌面版**（托盘也要退），再跑一次 `car desktop fix`，然后重新打开。\n",
+    );
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function cmdStatus(_opts: Record<string, string>): void {

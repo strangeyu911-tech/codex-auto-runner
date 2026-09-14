@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ManagedTask } from "@car/persistence";
 import { TaskEngine } from "../src/index.js";
 
@@ -160,9 +162,22 @@ function makeTask(overrides: Partial<ManagedTask> = {}): ManagedTask {
 }
 
 /** 建一套 harness：假 client + 内存 repo + 真 engine */
-function harness(opts: { task?: Partial<ManagedTask>; maxForksPerTask?: number } = {}) {
+function harness(
+  opts: {
+    task?: Partial<ManagedTask>;
+    maxForksPerTask?: number;
+    /** 预置桌面版状态文件内容；不传则只有一个空目录（登记会安全地失败） */
+    desktopState?: Record<string, unknown>;
+  } = {},
+) {
   const repo = new FakeRepo(makeTask(opts.task));
   const client = new FakeClient();
+  // 关键：codexHome 必须指向临时目录。落到真实 %USERPROFILE%\.codex 的话，
+  // 这些单测会去改用户桌面版的侧边栏状态文件。
+  const codexHome = mkdtempSync(join(tmpdir(), "car-desktop-registry-"));
+  if (opts.desktopState) {
+    writeFileSync(join(codexHome, ".codex-global-state.json"), JSON.stringify(opts.desktopState), "utf8");
+  }
   const engine = new TaskEngine({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     client: client as any,
@@ -171,10 +186,11 @@ function harness(opts: { task?: Partial<ManagedTask>; maxForksPerTask?: number }
     logger: silentLogger,
     tasksDir: tmpdir(),
     maxForksPerTask: opts.maxForksPerTask,
+    desktopRegistry: { enabled: true, codexHome },
   });
   // 默认：线程可读且不在别处运行
   client.onMethod("thread/read", () => ({ thread: { status: { type: "idle" }, turns: [] } }));
-  return { repo, client, engine };
+  return { repo, client, engine, codexHome };
 }
 
 /** 让 turn 在下一轮宏任务里完成（此时 awaitTurnCompletion 已注册 resolver） */
@@ -236,6 +252,50 @@ describe("writer conflict -> thread/fork 降级", () => {
 
     // 落了可追溯的事件
     expect(repo.events.some((e) => e.type === "thread/fork.fallback")).toBe(true);
+  });
+
+  it("把 fork 出来的子线程登记进桌面版侧边栏（否则用户永远看不到它）", async () => {
+    const projectId = "proj-1";
+    const { repo, client, engine, codexHome } = harness({
+      task: { projectPath: tmpdir() },
+      desktopState: {
+        "local-projects": { [projectId]: { id: projectId, name: "fixture", rootPaths: [tmpdir()] } },
+        // 父线程已归属该项目 —— 子线程直接继承
+        "thread-project-assignments": { "parent-1": { projectKind: "local", projectId } },
+        "sidebar-project-thread-orders": { [projectId]: { threadIds: ["parent-1"] } },
+      },
+    });
+    client.fail("thread/resume", "thread parent-1 already has an active writer");
+    client.onMethod("thread/fork", () => ({ thread: { id: "child-1" } }));
+    client.onMethod("turn/start", () => {
+      completeTurnAfter(client, "child-1");
+      return { turn: { id: "turn-1" } };
+    });
+
+    await engine.runOneTurn(repo.getTask("task-1")!);
+
+    const state = JSON.parse(readFileSync(join(codexHome, ".codex-global-state.json"), "utf8")) as Record<string, any>;
+    expect(state["thread-project-assignments"]["child-1"]).toEqual({ projectKind: "local", projectId });
+    expect(state["sidebar-project-thread-orders"][projectId].threadIds[0]).toBe("child-1");
+
+    const evt = repo.events.find((e) => e.type === "thread.desktop_registered") as { payload: any } | undefined;
+    expect(evt).toBeDefined();
+    expect(evt!.payload.placement).toBe("project");
+    expect(evt!.payload.projectId).toBe(projectId);
+  });
+
+  it("桌面版状态文件不可用时只记事件，绝不影响续跑", async () => {
+    const { repo, client, engine } = harness(); // 空目录 → 没有状态文件
+    client.fail("thread/resume", "thread parent-1 already has an active writer");
+    client.onMethod("thread/fork", () => ({ thread: { id: "child-1" } }));
+    client.onMethod("turn/start", () => {
+      completeTurnAfter(client, "child-1");
+      return { turn: { id: "turn-1" } };
+    });
+
+    const outcome = await engine.runOneTurn(repo.getTask("task-1")!);
+    expect(outcome.status).toBe("needs_continue");
+    expect(repo.events.some((e) => e.type === "thread.desktop_register_skipped")).toBe(true);
   });
 
   it("不对刚 fork 出来的子线程再发 resume（子线程 writer 就是本 client）", async () => {

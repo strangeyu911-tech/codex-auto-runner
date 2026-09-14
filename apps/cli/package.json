@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@car/desktop-registry": "workspace:*",
     "@car/persistence": "workspace:*",
     "@car/quota-engine": "workspace:*",
     "@car/shared-types": "workspace:*"

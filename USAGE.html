@@ -190,6 +190,7 @@
     <li><a href="#verify">如何确认它真在跑</a></li>
     <li><a href="#state">任务状态含义</a></li>
     <li><a href="#cli">命令速查</a></li>
+    <li><a href="#desktop-visible">为什么续跑的线程在桌面版里看不见</a></li>
     <li><a href="#env">环境变量</a></li>
     <li><a href="#files">数据与文件位置</a></li>
     <li><a href="#faq">常见问题</a></li>
@@ -426,10 +427,34 @@
 <span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task run-now &lt;id&gt; <span class="c"># 立即运行</span>
 <span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task pause &lt;id&gt;  <span class="c"># 暂停</span>
 <span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task resume &lt;id&gt; <span class="c"># 恢复</span>
-<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task cancel &lt;id&gt; <span class="c"># 取消</span></code></pre>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts task cancel &lt;id&gt; <span class="c"># 取消</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts desktop status <span class="c"># 检查 CAR 线程在桌面版侧边栏会不会「隐身」</span>
+<span class="k">node</span> node_modules\tsx\dist\cli.mjs apps\cli\src\index.ts desktop fix    <span class="c"># 把它们补登记进侧边栏</span></code></pre>
 
 <p><code>pause / resume / run-now</code> 直接写数据库；daemon 的调度器在下一个 tick 读取。
 daemon 没在跑时状态照样写入，启动后会被处理。</p>
+
+<h3 id="desktop-visible">为什么续跑的线程在桌面版里看不见</h3>
+
+<p>Codex 桌面版的侧边栏<strong>不是</strong>按 app-server 的 <code>thread/list</code> 渲染的 ——
+它只认自己 <code>.codex-global-state.json</code> 里的成员表（<code>thread-project-assignments</code> /
+<code>sidebar-project-thread-orders</code> / <code>projectless-thread-ids</code>），
+而它只在<strong>自己建线程</strong>或<strong>用户改动项目根路径</strong>时才做归属对账。
+于是 CAR 用 <code>thread/start</code> 或 <code>thread/fork</code> 造出来的线程对用户是隐形的：
+app-server 侧一切正常，桌面版里怎么翻都找不到。</p>
+
+<p>CAR 的应对分三层：</p>
+<ol>
+  <li>线程一造出来就登记一次（<code>registerThreadInDesktop</code>）；</li>
+  <li>daemon 每 2 分钟自愈扫描一次 —— 因为 fork 只在「桌面版正持锁」时触发，
+      也就是桌面版<strong>正开着</strong>，那一刻写进去的登记会被它随后的写盘覆盖。
+      桌面版一关掉，下一次扫描就补上；</li>
+  <li>手动入口 <code>car desktop fix</code>：想立刻见效就<strong>完全退出桌面版</strong>再跑它，然后重新打开。</li>
+</ol>
+
+<p>写入是只增不删的增量合并：先读后写并比对 <code>size/mtimeMs</code>（被桌面版抢先写过就重读重试），
+同目录 tmp + rename 原子落盘，首次改动前留一份 <code>.car-backup</code>。
+读不到 / 解析失败一律放弃写入，绝不新建或清空该文件。临时关闭：<code>CAR_DESKTOP_REGISTRY=0</code>。</p>
 
 <h3>开发与检查</h3>
 <pre><code><span class="c">:: 构建前端</span>

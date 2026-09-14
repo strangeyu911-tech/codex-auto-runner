@@ -26,9 +26,13 @@ import { SqliteRepository } from "@car/persistence";
 import type { ManagedTask } from "@car/persistence";
 import { TaskEngine } from "@car/task-engine";
 import { prepareForRun, toleratesDirtyWorktree } from "@car/git-guard";
+import { registerThreadInDesktop } from "@car/desktop-registry";
 import type { QuotaSnapshot } from "@car/quota-engine";
 import { DEFAULT_DISCOVERY, runDiscovery, type DiscoveryConfig } from "./discovery.js";
 import { randomUUID } from "node:crypto";
+
+/** 侧边栏登记自愈的扫描间隔。低频即可 —— 它等的只是「桌面版被关掉」这个时机。 */
+const REGISTRY_SWEEP_INTERVAL_MS = 2 * 60_000;
 
 export interface SchedulerOptions {
   client: AppServerClient;
@@ -43,6 +47,11 @@ export interface SchedulerOptions {
    * 不传则用 DEFAULT_DISCOVERY（默认启用）。
    */
   discovery?: Partial<DiscoveryConfig>;
+  /**
+   * 桌面版侧边栏登记（低频自愈扫描）。不传则启用、写默认 codex home。
+   * 测试必须关掉或指向临时目录 —— 否则会去改用户桌面版的状态文件。
+   */
+  desktopRegistry?: { enabled?: boolean; codexHome?: string };
 }
 
 export class Scheduler {
@@ -54,7 +63,9 @@ export class Scheduler {
   private readonly getQuotaSnapshot: () => QuotaSnapshot | null;
   private readonly refreshQuotaSnapshot?: () => Promise<QuotaSnapshot | null>;
   private readonly discoveryCfg: DiscoveryConfig;
+  private readonly desktopRegistry: { enabled: boolean; codexHome?: string };
   private lastDiscoveryAt = 0;
+  private lastRegistrySweepAt = 0;
   private tickTimer: NodeJS.Timeout | null = null;
   private running = false;
 
@@ -67,6 +78,10 @@ export class Scheduler {
     this.getQuotaSnapshot = opts.getQuotaSnapshot;
     this.refreshQuotaSnapshot = opts.refreshQuotaSnapshot;
     this.discoveryCfg = { ...DEFAULT_DISCOVERY, ...(opts.discovery ?? {}) };
+    this.desktopRegistry = {
+      enabled: opts.desktopRegistry?.enabled ?? process.env.CAR_DESKTOP_REGISTRY !== "0",
+      codexHome: opts.desktopRegistry?.codexHome,
+    };
   }
 
   /** 启动周期性 tick（默认每 30 秒） */
@@ -202,6 +217,48 @@ export class Scheduler {
     setTimeout(() => void this.tick().catch((e) => this.log.error("scheduled tick error", { err: String(e) })), delay);
   }
 
+  /**
+   * 把 CAR 造出来的线程补登记进桌面版侧边栏。
+   *
+   * 为什么放在这里而不是只放在 fork 那一刻：fork 的触发条件恰恰是「桌面版正持有该线程
+   * 的写锁」，也就是桌面版**正开着**。桌面版的状态在内存里，它下一次写盘会覆盖我们的改动。
+   * 唯一可靠的时序是「桌面版完全退出 → 写入 → 桌面版启动」，所以需要一个周期性重试，
+   * 而 tick 正好是天然的心跳。
+   */
+  private sweepDesktopRegistry(): void {
+    if (!this.desktopRegistry.enabled) return;
+    const now = Date.now();
+    if (now - this.lastRegistrySweepAt < REGISTRY_SWEEP_INTERVAL_MS) return;
+    this.lastRegistrySweepAt = now;
+
+    let fixed = 0;
+    try {
+      for (const task of this.repo.listTasks()) {
+        if (!task.threadId) continue;
+        const res = registerThreadInDesktop({
+          threadId: task.threadId,
+          parentThreadId: task.forkedFromThreadId,
+          cwd: task.projectPath,
+          codexHome: this.desktopRegistry.codexHome,
+        });
+        if (!res.ok || !res.changed) continue;
+        fixed++;
+        this.repo.appendEvent(task.id, "thread.desktop_registered", {
+          threadId: task.threadId,
+          parentThreadId: task.forkedFromThreadId,
+          placement: res.placement,
+          projectId: res.projectId,
+          wroteKeys: res.wroteKeys,
+          source: "sweep",
+        });
+      }
+    } catch (e) {
+      this.log.warn("desktop registry sweep failed", { err: String(e) });
+      return;
+    }
+    if (fixed > 0) this.log.info("desktop sidebar registry swept", { fixed });
+  }
+
   /** 核心调度逻辑 */
   async tick(): Promise<void> {
     if (this.running) return;
@@ -223,6 +280,12 @@ export class Scheduler {
       // 仍然留在 hasRunningTask() 之后：已有 turn 在跑时不去额外压 app-server，
       // 反正同一时刻也只能跑一个任务，晚一轮接管不吃亏。
       await this.maybeDiscover();
+
+      // 侧边栏登记自愈：CAR 造的线程在桌面版侧边栏里是隐形的（桌面版只对自己建的
+      // 线程 / 用户改过根路径的项目做对账），而 fork 那一刻桌面版多半正开着 ——
+      // 那时写进去的登记会被它随后的写盘覆盖。所以这里低频重试：
+      // 桌面版一旦关掉，下一次扫描就把登记补上。幂等、只读一次状态文件、无写入则不落盘。
+      this.sweepDesktopRegistry();
 
       // 额度检查
       const quota = this.getQuotaSnapshot();

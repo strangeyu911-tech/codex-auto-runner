@@ -17,6 +17,7 @@
  */
 
 import { AppServerClient, isWriterConflict } from "@car/app-server-client";
+import { registerThreadInDesktop } from "@car/desktop-registry";
 import type { Logger } from "@car/logger";
 import { SqliteRepository } from "@car/persistence";
 import type { ManagedTask } from "@car/persistence";
@@ -46,6 +47,14 @@ export interface TaskEngineOptions {
    * 超限后不再 fork，改为退避等待 —— 避免父线程被长期持锁时无限产出孤儿线程。
    */
   maxForksPerTask?: number;
+  /**
+   * 桌面版侧边栏登记（见 registerDesktopVisibility）。
+   *
+   * 生产环境不需要配置：默认启用、默认写 `%USERPROFILE%\.codex`。
+   * 提供 codexHome 主要是给测试用 —— 单测里若落到真实 codex home，
+   * 就会去改用户桌面版的状态文件。
+   */
+  desktopRegistry?: { enabled?: boolean; codexHome?: string };
 }
 
 /** 单回合执行结果 */
@@ -63,6 +72,7 @@ export class TaskEngine {
   private readonly log: Logger;
   private readonly tasksDir: string;
   private readonly maxForksPerTask: number;
+  private readonly desktopRegistry: { enabled: boolean; codexHome?: string };
 
   /** 当前等待中的回合：threadId -> resolve */
   private readonly pendingTurns = new Map<string, (o: TurnOutcome) => void>();
@@ -74,6 +84,10 @@ export class TaskEngine {
     const local = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
     this.tasksDir = opts.tasksDir ?? join(local, "CodexAutoRunner", "tasks");
     this.maxForksPerTask = opts.maxForksPerTask ?? 5;
+    this.desktopRegistry = {
+      enabled: opts.desktopRegistry?.enabled ?? process.env.CAR_DESKTOP_REGISTRY !== "0",
+      codexHome: opts.desktopRegistry?.codexHome,
+    };
     mkdirSync(this.tasksDir, { recursive: true });
 
     // 订阅通知
@@ -198,7 +212,47 @@ export class TaskEngine {
     const id = resp.thread?.id;
     if (!id) throw new Error("thread/start returned no thread.id");
     this.repo.appendEvent(task.id, "thread/started", { threadId: id });
+    this.registerDesktopVisibility(task, { threadId: id, cwd: task.projectPath });
     return id;
+  }
+
+  /**
+   * 把 CAR 造出来的线程登记进桌面版侧边栏。
+   *
+   * 为什么必须有这一步：桌面版侧边栏不按 `thread/list` 渲染，它只认自己
+   * `.codex-global-state.json` 里的成员表（thread-project-assignments /
+   * sidebar-project-thread-orders / projectless-thread-ids），而它只在
+   * 「自己建线程」或「用户改动项目根路径」时才做对账。于是 CAR 通过
+   * thread/start、thread/fork 造出来的线程**永远不会**出现在侧边栏，
+   * 用户既找不到也接不上 —— 等于这个自动续跑白跑。
+   *
+   * 登记是尽力而为：失败只记事件，绝不影响续跑主流程。
+   * 桌面版正在运行时写入要等它重启才可见（它的状态在内存里）。
+   */
+  private registerDesktopVisibility(
+    task: ManagedTask,
+    args: { threadId: string; parentThreadId?: string | null; cwd?: string | null },
+  ): void {
+    if (!this.desktopRegistry.enabled) return;
+    try {
+      const res = registerThreadInDesktop({
+        ...args,
+        cwd: args.cwd ?? task.projectPath,
+        codexHome: this.desktopRegistry.codexHome,
+      });
+      this.repo.appendEvent(task.id, res.ok ? "thread.desktop_registered" : "thread.desktop_register_skipped", {
+        threadId: args.threadId,
+        parentThreadId: args.parentThreadId ?? null,
+        changed: res.changed,
+        placement: res.placement,
+        projectId: res.projectId,
+        wroteKeys: res.wroteKeys,
+        reason: res.reason,
+      });
+      if (!res.ok) this.log.warn("desktop sidebar registration skipped", { threadId: args.threadId, reason: res.reason });
+    } catch (e) {
+      this.log.warn("desktop sidebar registration failed", { threadId: args.threadId, err: String(e) });
+    }
   }
 
   private async resumeThread(task: ManagedTask, threadId: string): Promise<void> {
@@ -307,6 +361,8 @@ export class TaskEngine {
       childThreadId,
       forkCount: task.forkCount + 1,
     });
+    // 分叉出来的孩子是条全新线程 —— 不登记就永远不出现在桌面版侧边栏里。
+    this.registerDesktopVisibility(task, { threadId: childThreadId, parentThreadId, cwd: task.projectPath });
     return childThreadId;
   }
 

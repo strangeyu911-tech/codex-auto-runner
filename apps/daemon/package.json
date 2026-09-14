@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@car/app-server-client": "workspace:*",
+    "@car/desktop-registry": "workspace:*",
     "@car/codex-resolver": "workspace:*",
     "@car/git-guard": "workspace:*",
     "@car/logger": "workspace:*",

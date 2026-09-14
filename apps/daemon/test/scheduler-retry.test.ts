@@ -13,7 +13,7 @@
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,6 +43,8 @@ function makeScheduler(
     client?: AppServerClient;
     /** 额度快照替身；默认 available（即「额度闸门不拦」） */
     quota?: QuotaSnapshot;
+    /** 侧边栏登记替身；默认**关闭** —— 否则单测会去改用户桌面版的状态文件 */
+    desktopRegistry?: { enabled?: boolean; codexHome?: string };
   } = {},
 ): { scheduler: Scheduler; calls: string[]; rpcCalls: string[] } {
   const calls: string[] = [];
@@ -79,6 +81,11 @@ function makeScheduler(
     logger: createLogger({ level: "error" }),
     isAutoRunEnabled: () => true,
     getQuotaSnapshot: () => quota,
+    // 默认关掉：这些用例会用真实的 threadId（甚至是用户真线程 id），
+    // 开着就会往 %USERPROFILE%\.codex\.codex-global-state.json 里写东西。
+    desktopRegistry: opts.desktopRegistry
+      ? { enabled: opts.desktopRegistry.enabled ?? false, codexHome: opts.desktopRegistry.codexHome }
+      : { enabled: false },
   });
   return { scheduler, calls, rpcCalls };
 }
@@ -351,4 +358,50 @@ test("git guard: a brand-new write task is still parked on a dirty workspace", a
 
 after(() => {
   for (const dir of createdProjects) rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// 桌面版侧边栏登记 与 tick
+//
+// CAR 用 thread/start / thread/fork 造出来的线程在桌面版侧边栏里是隐形的：侧边栏认的是
+// 桌面版自己 .codex-global-state.json 里的成员表。fork 又恰恰只在「桌面版正持锁」时发生，
+// 那一刻写进去的登记会被桌面版随后的写盘覆盖 —— 所以要靠 tick 周期性地补。
+// 这里用一个临时 codexHome 验：tick 会把 CAR 的线程登记进所属项目组。
+// ---------------------------------------------------------------------------
+
+test("desktop registry: tick 把 CAR 的线程补登记进桌面版侧边栏", async () => {
+  const { repo } = setup();
+  const project = makeProject();
+  const threadId = "car-child-0001";
+  const projectId = "proj-desktop-1";
+
+  const codexHome = mkdtempSync(join(tmpdir(), "car-desktop-home-"));
+  createdProjects.push(codexHome);
+  writeFileSync(
+    join(codexHome, ".codex-global-state.json"),
+    JSON.stringify({
+      "local-projects": { [projectId]: { id: projectId, name: "fixture", rootPaths: [project] } },
+      "thread-project-assignments": {},
+      "sidebar-project-thread-orders": { [projectId]: { threadIds: [] } },
+    }),
+    "utf8",
+  );
+
+  // 任务故意不置 READY：本用例只验扫描，不要顺手把 turn 跑起来
+  const task = repo.createTask({
+    title: "forked by CAR", projectPath: project, originalGoal: "g", priority: 50,
+    mode: "resume_thread", threadId, sandboxMode: "readOnly",
+  });
+  repo.forceStatus(task.id, "WAITING_USER");
+
+  const { scheduler } = makeScheduler(repo, { desktopRegistry: { enabled: true, codexHome } });
+  await scheduler.tick();
+
+  const state = JSON.parse(readFileSync(join(codexHome, ".codex-global-state.json"), "utf8")) as Record<string, any>;
+  assert.deepEqual(state["thread-project-assignments"][threadId], { projectKind: "local", projectId });
+  assert.ok(
+    state["sidebar-project-thread-orders"][projectId].threadIds.includes(threadId),
+    "子线程要出现在项目的排序表里",
+  );
+  repo.close();
 });

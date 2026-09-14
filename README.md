@@ -126,6 +126,7 @@ codex-auto-runner/
   packages/
     app-server-client/    Codex app-server JSON-RPC 客户端
     codex-resolver/       自动探测并暂存 Codex 可执行文件
+    desktop-registry/     把 CAR 造的线程登记进 Codex 桌面版侧边栏
     quota-engine/         额度桶解析、阻塞判定、恢复时间计算
     persistence/          SQLite 任务、事件、锁与状态机
     task-engine/          thread resume/start/fork、目标激活、turn 生命周期
