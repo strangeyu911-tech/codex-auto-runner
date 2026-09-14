@@ -21,8 +21,11 @@
  *   - 原子落盘：同目录 tmp + rename（桌面版自己也是这么写的）。
  *   - 首次改动前留一份 `.car-backup`，只留一次，不覆盖。
  *   - 解析失败 / 文件不存在 / 形状不符 → 一律放弃写入并返回原因，**绝不新建或清空**该文件。
- *   - 桌面版**正在运行时**写入不会被它读取（它的状态在内存里），需重启后才可见；
- *     这不影响安全性（我们的写入不会污染它已加载的内存数据），只是需要一次性重启。
+ *   - ⚠️ 桌面版**正在运行时**，它的状态在内存里，**下一次写盘会把我们的整条写入覆盖掉**
+ *     （实测：写进去的登记活了 90 秒，约 11 分钟后被抹回 undefined）。
+ *     所以可靠顺序只有一种：完全退出桌面版 → 写入 → 启动桌面版。
+ *     调用方要么自己周期性重试（等桌面版被关掉），要么让用户按这个顺序手动跑一次。
+ *     —— 安全性不受影响：我们的写入是完整的合法 JSON，最坏结果是被覆盖，不会污染或损坏它。
  */
 
 import { copyFileSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -236,11 +239,16 @@ export function registerThreadInDesktop(input: RegisterThreadInput): RegisterThr
 
     const plan = planRegistration(state, input);
     if (!plan) {
+      // 已经收下了 —— 把**真实归属**回读出来还给调用方。
+      // 否则调用方只能看到 projectId=null，会把已归入项目的线程误报成「未分组」。
+      const existing = asRecord(state[KEY_ASSIGNMENTS])[input.threadId];
+      const existingProjectId = isAssignment(existing) ? existing.projectId : null;
+      const inProjectless = existingProjectId === null && asIdArray(state[KEY_PROJECTLESS]).includes(input.threadId);
       return {
         ok: true,
         changed: false,
-        projectId: null,
-        placement: "none",
+        projectId: existingProjectId,
+        placement: existingProjectId ? "project" : inProjectless ? "projectless" : "none",
         wroteKeys: [],
         reason: "桌面版已收下这条线程，无需改动",
       };

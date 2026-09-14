@@ -150,6 +150,26 @@ describe("registerThreadInDesktop", () => {
     expect((backup2["thread-project-assignments"] as Record<string, unknown>)["another"]).toBeUndefined();
   });
 
+  it("reports the real project when the thread is already registered", () => {
+    // 这条线程早就在项目里了 —— 重复登记必须回传真实归属，
+    // 否则调用方（car desktop fix）会把已归组的线程误显示成「未分组」。
+    write(fixture());
+    const res = registerThreadInDesktop({ threadId: PARENT, codexHome: dir });
+    expect(res.ok).toBe(true);
+    expect(res.changed).toBe(false);
+    expect(res.projectId).toBe(PROJECT_ID);
+    expect(res.placement).toBe("project");
+    expect(readFileSync(statePath, "utf8")).toBe(JSON.stringify(fixture()));
+  });
+
+  it("reports the ungrouped bucket for an already-parked thread", () => {
+    write(fixture());
+    const res = registerThreadInDesktop({ threadId: "some-automation-thread", codexHome: dir });
+    expect(res.changed).toBe(false);
+    expect(res.projectId).toBeNull();
+    expect(res.placement).toBe("projectless");
+  });
+
   it("dryRun reports the plan without touching the file", () => {
     write(fixture());
     const before = readFileSync(statePath, "utf8");
