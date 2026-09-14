@@ -278,6 +278,9 @@ pnpm test
 
 更多说明见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+协议与实现上的已知陷阱——app-server 协议、桌面版侧边栏可见性、本机 Windows 开发环境——统一记录在
+[docs/PITFALLS.md](docs/PITFALLS.md)。动手改代码前建议先读一遍。
+
 ## 当前状态
 
 项目已经具备核心闭环：

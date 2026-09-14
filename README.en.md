@@ -264,6 +264,10 @@ pnpm test
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
+Known protocol and implementation pitfalls — app-server protocol, desktop sidebar visibility,
+and the local Windows dev environment — are collected in [docs/PITFALLS.md](docs/PITFALLS.md).
+Worth a read before changing code.
+
 ## Current Status
 
 The core local loop is implemented:
